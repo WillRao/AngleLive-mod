@@ -1,0 +1,314 @@
+//
+//  PlatformDetailViewController.swift
+//  AngelLive
+//
+//  Created by pangchong on 10/21/25.
+//
+
+import UIKit
+import SwiftUI
+import SharedAssets
+import JXSegmentedView
+import AngelLiveCore
+import AngelLiveDependencies
+
+class PlatformDetailViewController: UIViewController {
+
+    // MARK: - Properties
+
+    private var viewModel: PlatformDetailViewModel
+    private let navigationState: LiveRoomNavigationState
+    private let namespace: Namespace.ID
+    private weak var favoriteModel: AppFavoriteModel?
+    private let pluginAvailability: PluginAvailabilityService
+    /// 透传给 SubCategoryViewController / RoomListViewController,用来弹收藏失败的 toast。
+    var toastPresenter: ((ToastValue) -> Void)?
+
+    // 骨架屏容器
+    private var skeletonHostingController: UIHostingController<PlatformDetailSkeletonView>?
+
+    // 错误视图容器
+    private var errorHostingController: UIHostingController<AnyView>?
+
+    // 主分类 JXSegmentedView
+    private lazy var mainCategoryDataSource = JXSegmentedTitleDataSource()
+
+    private lazy var mainCategorySegmentedView: JXSegmentedView = {
+        let view = JXSegmentedView()
+        FullUIMainCategoryStyle.configure(view, dataSource: mainCategoryDataSource)
+        view.delegate = self
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
+    }()
+
+    // 主分类容器（用于嵌套子分类）
+    private lazy var mainListContainerView: JXSegmentedListContainerView = {
+        let container = JXSegmentedListContainerView(dataSource: self)
+        container.translatesAutoresizingMaskIntoConstraints = false
+        return container
+    }()
+
+    // MARK: - Initialization
+
+    init(
+        viewModel: PlatformDetailViewModel,
+        navigationState: LiveRoomNavigationState,
+        namespace: Namespace.ID,
+        favoriteModel: AppFavoriteModel? = nil,
+        pluginAvailability: PluginAvailabilityService
+    ) {
+        self.viewModel = viewModel
+        self.navigationState = navigationState
+        self.namespace = namespace
+        self.favoriteModel = favoriteModel
+        self.pluginAvailability = pluginAvailability
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    // MARK: - Lifecycle
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupUI()
+        loadCategories()
+    }
+
+    // MARK: - Setup
+
+    private func setupUI() {
+        view.backgroundColor = UIColor(AppConstants.Colors.primaryBackground)
+        title = viewModel.platform.title
+
+        // 先显示骨架屏
+        showSkeletonView()
+
+        view.addSubview(mainCategorySegmentedView)
+        view.addSubview(mainListContainerView)
+
+        NSLayoutConstraint.activate([
+            // 主分类 SegmentedView
+            mainCategorySegmentedView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            mainCategorySegmentedView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            mainCategorySegmentedView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
+            mainCategorySegmentedView.heightAnchor.constraint(equalToConstant: FullUIMainCategoryStyle.height),
+
+            // 主分类容器
+            mainListContainerView.topAnchor.constraint(equalTo: mainCategorySegmentedView.bottomAnchor),
+            mainListContainerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            mainListContainerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            mainListContainerView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+
+        // 关联主分类 segmentedView 和容器
+        mainCategorySegmentedView.listContainer = mainListContainerView
+    }
+
+    private func setupMainCategories() {
+        let titles = viewModel.categories.map { $0.title }
+        mainCategoryDataSource.titles = titles
+        mainCategorySegmentedView.reloadData()
+        mainListContainerView.reloadData()
+
+        // 默认选中第一个
+        if !viewModel.categories.isEmpty {
+            viewModel.selectedMainCategoryIndex = 0
+        }
+    }
+
+    // MARK: - Data Loading
+
+    private func loadCategories() {
+        Task { @MainActor in
+            await viewModel.loadCategories()
+
+            if let error = viewModel.categoryError {
+                // 加载失败，显示错误视图
+                hideSkeletonView()
+                showErrorView(error: error)
+            } else if !viewModel.categories.isEmpty {
+                setupMainCategories()
+                // 加载完成后隐藏骨架屏
+                hideSkeletonView()
+                hideErrorView()
+            }
+        }
+    }
+
+    // MARK: - Skeleton View Methods
+
+    private func showSkeletonView() {
+        let skeletonView = PlatformDetailSkeletonView()
+        let hostingController = UIHostingController(rootView: skeletonView)
+        hostingController.view.translatesAutoresizingMaskIntoConstraints = false
+
+        addChild(hostingController)
+        view.addSubview(hostingController.view)
+        hostingController.didMove(toParent: self)
+
+        NSLayoutConstraint.activate([
+            hostingController.view.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            hostingController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hostingController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            hostingController.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+
+        skeletonHostingController = hostingController
+
+        // 隐藏实际内容
+        mainCategorySegmentedView.alpha = 0
+        mainListContainerView.alpha = 0
+    }
+
+    private func hideSkeletonView() {
+        guard let skeletonHostingController = skeletonHostingController else { return }
+
+        UIView.animate(withDuration: 0.3, animations: {
+            skeletonHostingController.view.alpha = 0
+            self.mainCategorySegmentedView.alpha = 1
+            self.mainListContainerView.alpha = 1
+        }) { _ in
+            skeletonHostingController.willMove(toParent: nil)
+            skeletonHostingController.view.removeFromSuperview()
+            skeletonHostingController.removeFromParent()
+            self.skeletonHostingController = nil
+        }
+    }
+
+    // MARK: - Error View Methods
+
+    private func showErrorView(error: Error) {
+        // 如果已经显示错误视图，先移除
+        hideErrorView()
+
+        let errorView = ErrorView(
+            title: error.isAuthRequired
+                ? "加载失败-请登录\(LiveParseTools.getLivePlatformName(viewModel.platform.liveType))账号"
+                : "加载失败",
+            message: error.showsLoginAction ? error.liveParseMessage : "无法获取分类列表",
+            detailMessage: error.showsLoginAction ? error.liveParseDetail : error.localizedDescription,
+            showDismiss: true,
+            showRetry: true,
+            showLoginButton: error.showsLoginAction,
+            showDetailButton: error.liveParseDetail?.isEmpty == false,
+            onDismiss: { [weak self] in
+                self?.navigationController?.popViewController(animated: true)
+            },
+            onRetry: { [weak self] in
+                self?.hideErrorView()
+                self?.showSkeletonView()
+                self?.loadCategories()
+            },
+            onLogin: error.showsLoginAction ? { [weak self] in
+                self?.presentAuthenticationRecovery()
+            } : nil
+        )
+
+        let hostingController = UIHostingController(
+            rootView: AnyView(errorView.supportDiagnosticsEnabled().environment(pluginAvailability).fullUIArcLoadingStyle().fullUIWindowContext())
+        )
+        hostingController.view.translatesAutoresizingMaskIntoConstraints = false
+
+        addChild(hostingController)
+        view.addSubview(hostingController.view)
+        hostingController.didMove(toParent: self)
+
+        NSLayoutConstraint.activate([
+            hostingController.view.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            hostingController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hostingController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            hostingController.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+
+        errorHostingController = hostingController
+
+        // 隐藏实际内容
+        mainCategorySegmentedView.alpha = 0
+        mainListContainerView.alpha = 0
+    }
+
+    @MainActor
+    private func presentAuthenticationRecovery() {
+        let pluginIDs = SandboxPluginCatalog.platform(for: viewModel.platform.liveType)
+            .map { [$0.pluginId] } ?? []
+        let recoveryView = NavigationStack {
+            PlatformAccountLoginView(recoveryPluginIDs: pluginIDs)
+        }
+        .environment(pluginAvailability)
+        .fullUIArcLoadingStyle()
+        let hostingController = UIHostingController(rootView: recoveryView)
+        hostingController.modalPresentationStyle = .pageSheet
+        present(hostingController, animated: true)
+    }
+
+    private func hideErrorView() {
+        guard let errorHostingController = errorHostingController else { return }
+
+        errorHostingController.willMove(toParent: nil)
+        errorHostingController.view.removeFromSuperview()
+        errorHostingController.removeFromParent()
+        self.errorHostingController = nil
+    }
+
+    // MARK: - Public Methods
+
+    func selectCategory(mainIndex: Int, subIndex: Int) {
+        // 切换到指定的主分类
+        guard viewModel.categories.indices.contains(mainIndex) else { return }
+
+        viewModel.selectedMainCategoryIndex = mainIndex
+        mainCategorySegmentedView.selectItemAt(index: mainIndex)
+
+        // 延迟切换子分类，确保主分类动画完成
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self = self else { return }
+            if let subCategoryVC = self.mainListContainerView.validListDict[mainIndex] as? SubCategoryViewController {
+                subCategoryVC.selectSubCategory(at: subIndex)
+            }
+        }
+    }
+}
+
+// MARK: - JXSegmentedViewDelegate
+
+extension PlatformDetailViewController: JXSegmentedViewDelegate {
+    func segmentedView(_ segmentedView: JXSegmentedView, didSelectedItemAt index: Int) {
+        // 只处理主分类切换
+        if segmentedView == mainCategorySegmentedView {
+            guard index != viewModel.selectedMainCategoryIndex else { return }
+
+            Task { @MainActor in
+                await viewModel.selectMainCategory(index: index)
+
+                // 通知对应的子页面更新
+                if let childVC = mainListContainerView.validListDict[index] as? SubCategoryViewController {
+                    childVC.updateSubCategories()
+                }
+            }
+        }
+    }
+}
+
+// MARK: - JXSegmentedListContainerViewDataSource
+
+extension PlatformDetailViewController: JXSegmentedListContainerViewDataSource {
+    func numberOfLists(in listContainerView: JXSegmentedListContainerView) -> Int {
+        return viewModel.categories.count
+    }
+
+    func listContainerView(_ listContainerView: JXSegmentedListContainerView, initListAt index: Int) -> JXSegmentedListContainerViewListDelegate {
+        let vc = SubCategoryViewController(
+            viewModel: viewModel,
+            mainCategoryIndex: index,
+            navigationState: navigationState,
+            namespace: namespace,
+            favoriteModel: favoriteModel,
+            pluginAvailability: pluginAvailability
+        )
+        vc.toastPresenter = toastPresenter
+        return vc
+    }
+}

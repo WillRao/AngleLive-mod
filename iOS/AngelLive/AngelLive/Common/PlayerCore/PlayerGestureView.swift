@@ -1,0 +1,775 @@
+import SwiftUI
+import UIKit
+
+// MARK: - 左边缘滑动返回
+
+/// 只有左边缘 edgeWidth 内接收触摸，其余 hitTest 返回 nil 完全穿透。
+/// 内部用 UIScreenEdgePanGestureRecognizer，滑动距离/速度达标后回调 onDismiss。
+struct EdgeSwipeDismissView: UIViewRepresentable {
+    let edgeWidth: CGFloat
+    let onDismiss: () -> Void
+
+    func makeUIView(context: Context) -> EdgeHitPassthroughView {
+        let view = EdgeHitPassthroughView()
+        view.edgeWidth = edgeWidth
+        view.backgroundColor = .clear
+        let edge = UIScreenEdgePanGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleEdge)
+        )
+        edge.edges = .left
+        edge.delegate = context.coordinator
+        view.addGestureRecognizer(edge)
+        return view
+    }
+
+    func updateUIView(_ uiView: EdgeHitPassthroughView, context: Context) {
+        uiView.edgeWidth = edgeWidth
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onDismiss: onDismiss) }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        let onDismiss: () -> Void
+        init(onDismiss: @escaping () -> Void) { self.onDismiss = onDismiss }
+
+        @objc func handleEdge(_ g: UIScreenEdgePanGestureRecognizer) {
+            guard g.state == .ended else { return }
+            let tx = g.translation(in: g.view).x
+            let vx = g.velocity(in: g.view).x
+            if tx > 60 || vx > 300 {
+                onDismiss()
+            }
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool { true }
+    }
+}
+
+/// hitTest 只在左边缘 edgeWidth 内返回 self，其余返回 nil 穿透
+final class EdgeHitPassthroughView: UIView {
+    var edgeWidth: CGFloat = 20
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        point.x < edgeWidth ? super.hitTest(point, with: event) : nil
+    }
+}
+
+#if canImport(KSPlayer)
+
+//
+//  PlayerGestureView.swift
+//  AngelLive
+//
+//  播放器手势处理视图
+//  - 单击显示/隐藏控制层
+//  - 双击执行场景动作（默认全屏/退出全屏）
+//  - 左半边上下滑动调节亮度
+//  - 右半边上下滑动调节音量
+//
+
+import MediaPlayer
+import KSPlayer
+import AngelLiveCore
+internal import AVFoundation
+
+/// 手势调节类型
+enum GestureAdjustType {
+    case none
+    case brightness
+    case volume
+}
+
+enum PlayerHorizontalSwipeDirection {
+    case left
+    case right
+}
+
+/// 播放器手势处理视图
+struct PlayerGestureView: View {
+    @Environment(\.isIPadFullscreen) private var isIPadFullscreen: Binding<Bool>
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.safeAreaInsetsCustom) private var safeAreaInsets
+    @Environment(\.fullUIWindowContext) private var fullUIWindowContext
+    @Environment(\.fullUIPlayerIsFullscreen) private var fullUIPlayerIsFullscreen
+    @Environment(\.fullUIPlayerUsesInPlaceFullscreen) private var fullUIPlayerUsesInPlaceFullscreen
+
+    /// 单击回调
+    var onSingleTap: (() -> Void)?
+    /// 双击回调；未提供时沿用播放器默认的全屏/方向切换行为。
+    var onDoubleTap: (() -> Void)?
+    /// 仅在宿主显式注入时启用横向手势；默认入口保持原有亮度/音量行为。
+    var onHorizontalSwipe: ((PlayerHorizontalSwipeDirection) -> Void)?
+    private let edgePassthroughWidth: CGFloat
+    /// FullUI 仅在触摸播放画面期间阻止交互式返回。
+    private let preventsInteractiveDismissal: Bool
+    /// FullUI 注入可在任意线程调用的方向失败回调；其他入口保持既有行为。
+    private var orientationErrorHandler: (@Sendable (Error) -> Void)?
+    /// 锁定状态绑定
+    @Binding var isLocked: Bool
+
+    init(
+        onSingleTap: (() -> Void)? = nil,
+        onDoubleTap: (() -> Void)? = nil,
+        onHorizontalSwipe: ((PlayerHorizontalSwipeDirection) -> Void)? = nil,
+        edgePassthroughWidth: CGFloat = 20,
+        preventsInteractiveDismissal: Bool = false,
+        orientationErrorHandler: (@Sendable (Error) -> Void)? = nil,
+        isLocked: Binding<Bool>
+    ) {
+        self.onSingleTap = onSingleTap
+        self.onDoubleTap = onDoubleTap
+        self.onHorizontalSwipe = onHorizontalSwipe
+        self.edgePassthroughWidth = edgePassthroughWidth
+        self.preventsInteractiveDismissal = preventsInteractiveDismissal
+        self.orientationErrorHandler = orientationErrorHandler
+        _isLocked = isLocked
+    }
+
+    /// 当前调节类型
+    @State private var adjustType: GestureAdjustType = .none
+    /// 当前调节值 (0.0 - 1.0)
+    @State private var adjustValue: CGFloat = 0.0
+    /// 是否显示调节指示器
+    @State private var showIndicator: Bool = false
+    /// 滑动起始位置的值
+    @State private var startValue: CGFloat = 0.0
+    /// 是否正在滑动
+    @State private var isDragging: Bool = false
+    @State private var dragAxis: Axis?
+    @GestureState private var dragIsActive = false
+
+    /// 硬件音量键监听器（KVO 观察 outputVolume）
+    @State private var volumeObserver = VolumeButtonObserver()
+    /// 硬件音量键触发后自动隐藏 HUD 的延迟任务
+    @State private var hideIndicatorWorkItem: DispatchWorkItem?
+
+    /// 音量滑块（系统音量控制）
+    private let volumeView: MPVolumeView = {
+        let view = MPVolumeView(frame: CGRect(x: -1000, y: -1000, width: 1, height: 1))
+        view.isHidden = false
+        view.alpha = 0.01
+        return view
+    }()
+
+    /// 检测是否为横屏
+    private var isLandscape: Bool {
+        horizontalSizeClass == .compact && verticalSizeClass == .compact ||
+        horizontalSizeClass == .regular && verticalSizeClass == .compact
+    }
+
+    private var blocksCanvasDismissal: Bool {
+        if #available(iOS 18.0, *) {
+            return preventsInteractiveDismissal
+        }
+        return false
+    }
+
+    private var activationNotification: Notification.Name {
+        fullUIWindowContext == nil ? UIApplication.didBecomeActiveNotification : UIScene.didActivateNotification
+    }
+
+    private var deactivationNotification: Notification.Name {
+        fullUIWindowContext == nil ? UIApplication.willResignActiveNotification : UIScene.willDeactivateNotification
+    }
+
+    private func ownsLifecycleNotification(_ notification: Notification) -> Bool {
+        guard let context = fullUIWindowContext else { return true }
+        guard let scene = notification.object as? UIScene else { return false }
+        return scene === context.windowScene
+    }
+
+    private var gestureScreen: UIScreen? {
+        if let context = fullUIWindowContext {
+            return context.screen
+        }
+        // ShellUI retains its existing screen behavior until explicitly migrated.
+        return UIScreen.main
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            // 底部安全区域：使用实际安全区 + 额外边距，避免与系统底部手势（Home Indicator）冲突
+            let bottomSafeArea: CGFloat = max(safeAreaInsets.bottom + 20, 50)
+            // 顶部安全区域：横屏时避免与系统控制中心/通知中心下滑手势冲突
+            let topSafeArea: CGFloat = isLandscape ? max(safeAreaInsets.top + 20, 50) : 0
+
+            ZStack {
+                // 手势接收层：HStack 物理分离左边缘穿透区和主手势区
+                HStack(spacing: 0) {
+                    // 左边缘：不加 contentShape，触摸穿透给系统返回手势
+                    Color.clear
+                        .frame(width: edgePassthroughWidth)
+
+                    // FullUI 覆盖整块画面以阻止下拉退出，调节数值时仍排除系统安全带。
+                    gestureCanvas
+                        // 从后台返回时重置手势状态（修复 PIP 返回后 HUD 显示问题）
+                        .onReceive(NotificationCenter.default.publisher(for: activationNotification)) { notification in
+                            guard ownsLifecycleNotification(notification) else { return }
+                            resetGestureState()
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.bottom, blocksCanvasDismissal ? 0 : bottomSafeArea)
+                        .padding(.top, blocksCanvasDismissal ? 0 : topSafeArea)
+                        .gesture(
+                            DragGesture(minimumDistance: 20)
+                                .updating($dragIsActive) { _, active, _ in
+                                    active = true
+                                }
+                                .onChanged { value in
+                                    guard !isLocked else { return }
+                                    // 检查起始位置是否在顶部或底部安全区域内
+                                    guard value.startLocation.y > topSafeArea,
+                                          value.startLocation.y < geometry.size.height - bottomSafeArea else { return }
+                                    if onHorizontalSwipe != nil {
+                                        handleDirectionalDragChanged(value: value, in: geometry.size)
+                                    } else if GeneralSettingModel().enablePlayerGesture {
+                                        handleDragChanged(value: value, in: geometry.size)
+                                    }
+                                }
+                                .onEnded { value in
+                                    if onHorizontalSwipe != nil {
+                                        finishDirectionalDrag(value)
+                                        resetGestureState()
+                                    } else {
+                                        handleDragEnded()
+                                    }
+                                }
+                        )
+                        .simultaneousGesture(
+                            TapGesture(count: 2)
+                                .exclusively(before: TapGesture(count: 1))
+                                .onEnded { value in
+                                    switch value {
+                                    case .first:
+                                        // 双击优先，避免同时触发单击显隐。
+                                        guard !isLocked else { return }
+                                        handleDoubleTap()
+                                    case .second:
+                                        guard !isDragging else { return }
+                                        onSingleTap?()
+                                    }
+                                }
+                        )
+                }
+
+                // 调节指示器
+                if showIndicator {
+                    adjustIndicator
+                        .transition(.opacity)
+                }
+
+                // 隐藏的音量控制视图
+                VolumeViewWrapper(volumeView: volumeView)
+                    .frame(width: 1, height: 1)
+                    .opacity(0.01)
+            }
+        }
+        .onChange(of: dragIsActive) { _, active in
+            if !active && onHorizontalSwipe != nil {
+                resetGestureState()
+            }
+        }
+        .onChange(of: isLocked) { _, locked in
+            if locked && (onHorizontalSwipe != nil || blocksCanvasDismissal) {
+                resetGestureState()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: deactivationNotification)) { notification in
+            guard ownsLifecycleNotification(notification) else { return }
+            // 进入后台/画中画时重置手势状态
+            resetGestureState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: activationNotification)) { notification in
+            guard ownsLifecycleNotification(notification) else { return }
+            // 返回前台时重置手势状态
+            resetGestureState()
+        }
+        .onAppear {
+            // 监听硬件音量键，按下时复用滑动调节的同款 HUD
+            volumeObserver.onChange = { newVolume in
+                handleHardwareVolumeChange(newVolume)
+            }
+            volumeObserver.start()
+        }
+        .onDisappear {
+            volumeObserver.stop()
+            if onHorizontalSwipe != nil || blocksCanvasDismissal {
+                resetGestureState()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var gestureCanvas: some View {
+        if #available(iOS 18.0, *), preventsInteractiveDismissal {
+            Color.clear
+                .background {
+                    PlayerInteractiveDismissalSurface()
+                        .allowsHitTesting(false)
+                }
+        } else {
+            Color.clear
+        }
+    }
+
+    /// 重置手势状态
+    private func resetGestureState() {
+        hideIndicatorWorkItem?.cancel()
+        hideIndicatorWorkItem = nil
+        showIndicator = false
+        adjustType = .none
+        isDragging = false
+        dragAxis = nil
+    }
+
+    // MARK: - 调节指示器
+
+    private var adjustIndicator: some View {
+        HStack(spacing: 12) {
+            // 图标
+            Image(systemName: adjustType == .brightness ? "sun.max.fill" : "speaker.wave.2.fill")
+                .font(.system(size: 20))
+                .foregroundStyle(.white)
+                .frame(width: 24)
+
+            // 进度条（水平方向）
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    // 背景
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(.white.opacity(0.3))
+
+                    // 进度
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(.white)
+                        .frame(width: geo.size.width * adjustValue)
+                }
+            }
+            .frame(width: 120, height: 6)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    // MARK: - 手势处理
+
+    /// 处理双击手势
+    private func handleDoubleTap() {
+        if let onDoubleTap {
+            onDoubleTap()
+            return
+        }
+
+        if fullUIWindowContext != nil {
+            let wasFullscreen = fullUIPlayerIsFullscreen
+            let entersFullscreen = !wasFullscreen
+            if fullUIPlayerUsesInPlaceFullscreen {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    isIPadFullscreen.wrappedValue = entersFullscreen
+                }
+            } else {
+                isIPadFullscreen.wrappedValue = entersFullscreen
+                toggleiPhoneOrientation(fullscreenBeforeAction: wasFullscreen)
+            }
+            return
+        }
+
+        if AppConstants.Device.isIPad {
+            // iPad: 切换全屏模式
+            withAnimation(.easeInOut(duration: 0.3)) {
+                isIPadFullscreen.wrappedValue.toggle()
+            }
+        } else {
+            // iPhone: 切换横屏/竖屏
+            toggleiPhoneOrientation()
+        }
+    }
+
+    /// 切换 iPhone 屏幕方向
+    private func toggleiPhoneOrientation(fullscreenBeforeAction: Bool? = nil) {
+        let isCurrentlyLandscape = fullscreenBeforeAction
+            ?? (fullUIWindowContext == nil ? UIApplication.isLandscape : fullUIPlayerIsFullscreen)
+        let targetOrientation: UIInterfaceOrientationMask = isCurrentlyLandscape ? .portrait : .landscape
+
+        KSOptions.supportedInterfaceOrientations = targetOrientation
+
+        if #available(iOS 16.0, *) {
+            let currentScene: UIWindowScene?
+            if let context = fullUIWindowContext {
+                currentScene = context.windowScene
+            } else {
+                currentScene = UIApplication.shared.connectedScenes
+                    .compactMap({ $0 as? UIWindowScene })
+                    .first
+            }
+            guard let windowScene = currentScene else { return }
+
+            // 先通知 ViewController 刷新支持的方向
+            if let rootVC = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController {
+                rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
+            }
+            // 延迟到下一个 run loop，确保 VC 已刷新支持的方向
+            DispatchQueue.main.async {
+                let geometryPreferences = UIWindowScene.GeometryPreferences.iOS(
+                    interfaceOrientations: targetOrientation
+                )
+                if let orientationErrorHandler {
+                    windowScene.requestGeometryUpdate(geometryPreferences, errorHandler: orientationErrorHandler)
+                } else {
+                    windowScene.requestGeometryUpdate(geometryPreferences) { error in
+                        Logger.warning("切换屏幕方向失败: \(error)", category: .ui)
+                    }
+                }
+                // 旋转完成后恢复自由旋转，允许后续横屏自动全屏
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    KSOptions.supportedInterfaceOrientations = .allButUpsideDown
+                    if let rootVC = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController {
+                        rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
+                    }
+                }
+            }
+        } else {
+            let orientation: UIInterfaceOrientation = isCurrentlyLandscape ? .portrait : .landscapeRight
+            UIDevice.current.setValue(orientation.rawValue, forKey: "orientation")
+            UIViewController.attemptRotationToDeviceOrientation()
+        }
+    }
+
+    /// 处理拖动手势变化
+    private func handleDragChanged(value: DragGesture.Value, in size: CGSize, locksVerticalAxis: Bool = false) {
+        let startX = value.startLocation.x
+        let translation = value.translation
+
+        // 判断是否为垂直滑动（垂直位移大于水平位移）
+        guard locksVerticalAxis || abs(translation.height) > abs(translation.width) else { return }
+
+        isDragging = true
+
+        // 滑动开始，取消硬件音量键的自动隐藏任务，避免拖动途中被隐藏
+        hideIndicatorWorkItem?.cancel()
+        hideIndicatorWorkItem = nil
+
+        // 确定调节类型
+        if adjustType == .none {
+            if startX < size.width / 2 {
+                // 左半边 - 亮度
+                guard let screen = gestureScreen else { return }
+                adjustType = .brightness
+                startValue = screen.brightness
+            } else {
+                // 右半边 - 音量
+                adjustType = .volume
+                startValue = getSystemVolume()
+            }
+            adjustValue = startValue
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showIndicator = true
+            }
+        }
+
+        // 计算调节值（向上滑动增加，向下滑动减少）
+        let sensitivity: CGFloat = 1.0 / size.height // 整个高度对应 0-1
+        let delta = -translation.height * sensitivity
+        let newValue = max(0, min(1, startValue + delta))
+        adjustValue = newValue
+
+        // 应用调节
+        switch adjustType {
+        case .brightness:
+            gestureScreen?.brightness = newValue
+        case .volume:
+            setSystemVolume(newValue)
+        case .none:
+            break
+        }
+    }
+
+    /// 一次拖动只选一个方向，避免斜滑在清屏与音量/亮度之间来回切换。
+    private func handleDirectionalDragChanged(value: DragGesture.Value, in size: CGSize) {
+        let translation = value.translation
+        if dragAxis == nil {
+            if abs(translation.width) > abs(translation.height) * 1.5 {
+                dragAxis = .horizontal
+            } else if abs(translation.height) > abs(translation.width) * 1.5 {
+                dragAxis = .vertical
+            } else {
+                return
+            }
+        }
+
+        isDragging = true
+        if dragAxis == .vertical && GeneralSettingModel().enablePlayerGesture {
+            handleDragChanged(
+                value: value,
+                in: CGSize(width: max(1, size.width - edgePassthroughWidth), height: size.height),
+                locksVerticalAxis: true
+            )
+        }
+    }
+
+    private func finishDirectionalDrag(_ value: DragGesture.Value) {
+        guard !isLocked, dragAxis == .horizontal else { return }
+        let distance = value.translation.width
+        guard abs(distance) > abs(value.translation.height) * 1.5 else { return }
+        let isFlick = abs(distance) >= 24 && abs(value.velocity.width) >= 500
+            && distance * value.velocity.width > 0
+        guard abs(distance) >= 60 || isFlick else { return }
+        onHorizontalSwipe?(distance < 0 ? .left : .right)
+    }
+
+    /// 处理拖动手势结束
+    private func handleDragEnded() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showIndicator = false
+        }
+        // 延迟重置状态
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            adjustType = .none
+            isDragging = false
+        }
+    }
+
+    // MARK: - 硬件音量键
+
+    /// 处理硬件音量键变化：复用滑动调节的同款音量 HUD
+    private func handleHardwareVolumeChange(_ volume: Float) {
+        // 正在通过滑动调节音量时，HUD 已由拖动逻辑显示，避免重复处理
+        guard !isDragging else { return }
+        // 锁定时不弹出
+        guard !isLocked else { return }
+
+        adjustType = .volume
+        adjustValue = CGFloat(max(0, min(1, volume)))
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showIndicator = true
+        }
+        scheduleHardwareIndicatorHide()
+    }
+
+    /// 硬件音量键 HUD 自动隐藏（约 1 秒后淡出）
+    private func scheduleHardwareIndicatorHide() {
+        hideIndicatorWorkItem?.cancel()
+        let workItem = DispatchWorkItem {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showIndicator = false
+            }
+            adjustType = .none
+        }
+        hideIndicatorWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+    }
+
+    // MARK: - 音量控制
+
+    /// 获取系统音量
+    private func getSystemVolume() -> CGFloat {
+        let audioSession = AVAudioSession.sharedInstance()
+        return CGFloat(audioSession.outputVolume)
+    }
+
+    /// 设置系统音量
+    private func setSystemVolume(_ volume: CGFloat) {
+        // 使用 MPVolumeView 的 slider 来设置音量
+        if let slider = volumeView.subviews.first(where: { $0 is UISlider }) as? UISlider {
+            DispatchQueue.main.async {
+                slider.value = Float(volume)
+            }
+        }
+    }
+}
+
+/// 在播放画面触摸开始时，让呈现控制器的返回拖动失败，保留原有播放器手势。
+@available(iOS 18.0, *)
+private struct PlayerInteractiveDismissalSurface: UIViewRepresentable {
+    func makeUIView(context: Context) -> SurfaceView {
+        let view = SurfaceView()
+        view.isUserInteractionEnabled = false
+        view.observer.cancelsTouchesInView = false
+        view.observer.delaysTouchesBegan = false
+        view.observer.delaysTouchesEnded = false
+        view.observer.delegate = view
+        return view
+    }
+
+    func updateUIView(_ uiView: SurfaceView, context: Context) {
+        uiView.attachIfNeeded()
+    }
+
+    static func dismantleUIView(_ uiView: SurfaceView, coordinator: ()) {
+        uiView.detach()
+    }
+
+    @MainActor
+    final class SurfaceView: UIView, UIGestureRecognizerDelegate {
+        let observer = TouchObserver(target: nil, action: nil)
+        private weak var gestureHost: UIView?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard let window else {
+                detach()
+                return
+            }
+            attachIfNeeded()
+            // SwiftUI 初次挂载时，presented controller 的 parent 链可能尚未就绪。
+            if gestureHost == nil {
+                DispatchQueue.main.async { [weak self, weak window] in
+                    guard let self, let window, self.window === window else { return }
+                    self.attachIfNeeded()
+                }
+            }
+        }
+
+        func attachIfNeeded() {
+            guard window != nil else { return }
+            var responder: UIResponder? = next
+            while let current = responder {
+                if var controller = current as? UIViewController {
+                    while let parent = controller.parent { controller = parent }
+                    guard controller.presentingViewController != nil,
+                          let host = controller.viewIfLoaded else { return }
+                    guard gestureHost !== host else { return }
+                    detach()
+                    observer.controller = controller
+                    host.addGestureRecognizer(observer)
+                    gestureHost = host
+                    return
+                }
+                responder = current.next
+            }
+        }
+
+        func detach() {
+            observer.finishTracking()
+            gestureHost?.removeGestureRecognizer(observer)
+            gestureHost = nil
+            observer.controller = nil
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            guard let window, touch.view?.window === window,
+                  observer.controller?.presentingViewController != nil else { return false }
+            guard bounds.contains(touch.location(in: self)) else { return false }
+            observer.hasCanvasTouch = true
+            return true
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldBeRequiredToFailBy other: UIGestureRecognizer
+        ) -> Bool {
+            guard observer.hasCanvasTouch, let gestureHost else { return false }
+            // 呈现返回的 pan 挂在 controller 根视图；播放器拖动位于内部 SwiftUI 视图。
+            // 按每次触摸建立优先级，避免异步更新 SwiftUI 状态晚于系统首次识别。
+            let shouldWait = other.view === gestureHost
+                && other is UIPanGestureRecognizer
+                && !(other is UIScreenEdgePanGestureRecognizer)
+            return shouldWait
+        }
+    }
+
+    @MainActor
+    final class TouchObserver: UIGestureRecognizer {
+        weak var controller: UIViewController?
+        private var activeTouches = Set<UITouch>()
+        // 当前这次识别是否接收过播放区触摸起点；保持到 reset，避免影响其他区域。
+        var hasCanvasTouch = false
+
+        override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+        override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+            super.touchesBegan(touches, with: event)
+            let wasActive = !activeTouches.isEmpty
+            activeTouches.formUnion(touches)
+            if !wasActive { state = .began }
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+            super.touchesMoved(touches, with: event)
+            state = .changed
+        }
+
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+            super.touchesEnded(touches, with: event)
+            activeTouches.subtract(touches)
+            if activeTouches.isEmpty {
+                state = .ended
+            }
+        }
+
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+            super.touchesCancelled(touches, with: event)
+            activeTouches.removeAll()
+            state = .cancelled
+        }
+
+        override func reset() {
+            activeTouches.removeAll()
+            hasCanvasTouch = false
+            super.reset()
+        }
+
+        func finishTracking() {
+            activeTouches.removeAll()
+            if state == .began || state == .changed {
+                state = .cancelled
+            }
+            hasCanvasTouch = false
+        }
+    }
+}
+
+// MARK: - MPVolumeView Wrapper
+
+struct VolumeViewWrapper: UIViewRepresentable {
+    let volumeView: MPVolumeView
+
+    func makeUIView(context: Context) -> MPVolumeView {
+        return volumeView
+    }
+
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
+}
+
+// MARK: - 硬件音量键监听
+
+/// 通过 KVO 观察 `AVAudioSession.outputVolume`，硬件音量键按下导致系统音量变化时回调。
+///
+/// 不主动激活/配置 AudioSession——播放器在播放期间已激活会话，本视图也只在播放界面出现，
+/// 因此直接观察即可，避免干扰播放器的音频路由配置。
+final class VolumeButtonObserver: NSObject {
+    /// 音量变化回调（已切回主线程，参数为新的系统音量 0...1）
+    var onChange: ((Float) -> Void)?
+
+    private var observation: NSKeyValueObservation?
+
+    func start() {
+        guard observation == nil else { return }
+        let session = AVAudioSession.sharedInstance()
+        // 仅观察 .new，不带 .initial，避免注册时收到一次初始值误触发 HUD
+        observation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
+            guard let newVolume = change.newValue else { return }
+            DispatchQueue.main.async {
+                self?.onChange?(newVolume)
+            }
+        }
+    }
+
+    func stop() {
+        observation?.invalidate()
+        observation = nil
+    }
+
+    deinit {
+        observation?.invalidate()
+    }
+}
+
+#endif

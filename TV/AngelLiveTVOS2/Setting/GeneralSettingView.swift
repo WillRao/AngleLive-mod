@@ -1,0 +1,91 @@
+//
+//  GeneralSettingView.swift
+//  AngelLiveTVOS2
+//
+//  通用设置：只保留在当前宿主真实生效的选项。
+//  已移除：应用图标（新包没有备用图标资源）、禁用渐变背景（新界面不使用材质背景）。
+//
+
+import SwiftUI
+import AngelLiveCore
+import AngelLiveDependencies
+
+struct GeneralSettingView: View {
+    @Environment(AppState.self) private var appViewModel
+    @FocusState var focused: Bool
+    @StateObject var settingStore = SettingStore()
+    @AppStorage("SimpleLive.Setting.ShowHomeRecommendation") private var showHomeRecommendation = true
+
+    var body: some View {
+        @Bindable var playerSettingModel = appViewModel.playerSettingsViewModel
+        @Bindable var generalSettingModel = appViewModel.generalSettingsViewModel
+
+        ScrollView(.vertical) {
+            VStack(spacing: 40) {
+                Toggle(isOn: $playerSettingModel.openExitPlayerViewWhenLiveEnd) {
+                    Text("直播结束后自动退出直播间（不推荐）")
+                        .foregroundColor(.primary)
+                }
+                .frame(height: 45)
+                .focused($focused)
+
+                if playerSettingModel.openExitPlayerViewWhenLiveEnd {
+                    HStack {
+                        Text("自动退出直播间时间：")
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Menu {
+                            ForEach(PlayerSettingModel.timeArray.indices, id: \.self) { index in
+                                Button(PlayerSettingModel.timeArray[index]) {
+                                    playerSettingModel.getTimeSecond(index: index)
+                                }
+                            }
+                        } label: {
+                            Text("\(PlayerSettingModel.timeArray[playerSettingModel.openExitPlayerViewWhenLiveEndSecondIndex])")
+                                .foregroundColor(.primary)
+                                .frame(width: 250, alignment: .center)
+                        }
+                    }
+                    .frame(height: 45)
+                }
+
+                Toggle(isOn: $settingStore.syncSystemRate) {
+                    Text("匹配系统帧率")
+                        .foregroundColor(.primary)
+                }
+                .frame(height: 45)
+
+                if appViewModel.pluginAvailability.hasAvailablePlugins {
+                    Toggle(isOn: $showHomeRecommendation) {
+                        Text("显示推荐页面")
+                            .foregroundColor(.primary)
+                    }
+                    .frame(height: 45)
+                    .accessibilityHint("关闭后隐藏推荐页面，并在启动时显示收藏。")
+
+                    Picker("默认画质", selection: $playerSettingModel.defaultPlaybackQuality) {
+                        ForEach(DefaultPlaybackQuality.allCases, id: \.self) { quality in
+                            Text(quality.title)
+                                .tag(quality)
+                        }
+                    }
+                    .frame(height: 45)
+                    .accessibilityHint("进入直播间时按可用画质尽量匹配；网络较慢可选省流。")
+                }
+
+                Toggle(isOn: $generalSettingModel.developerModeEnabled) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("开发者模式")
+                            .foregroundColor(.primary)
+                        Text("记录播放事件，并显示播放时间轴。")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .frame(minHeight: 72)
+            }
+            .padding(.vertical, 50)
+        }
+        .scrollClipDisabled(appViewModel.pluginAvailability.hasAvailablePlugins)
+    }
+}

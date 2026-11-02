@@ -1,0 +1,2063 @@
+//
+//  HomeView.swift
+//  AngelLive
+//
+//  插件驱动的 iOS 首页：焦点内容、本地收藏和插件直播分区。
+//
+
+import AngelLiveCore
+import AngelLiveDependencies
+import Combine
+import SwiftUI
+import UIKit
+
+struct HomeView: View {
+    private let usesPersistedPlatformSelection: Bool
+
+    @Environment(AppFavoriteModel.self) private var favoriteModel
+    @Environment(PluginAvailabilityService.self) private var pluginAvailability
+    @Environment(\.presentToast) private var presentToast
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @AppStorage(HomePagePreference.selectedPluginStorageKey, store: .shared)
+    private var selectedPluginId = ""
+
+    @State private var viewModel = HomeViewModel()
+    @State private var navigationState = LiveRoomNavigationState()
+    @State private var homeNavigationModel = HomeNavigationModel()
+    @State private var isPullRefreshing = false
+    @State private var refreshCycle = 0
+    @State private var credentialRevision = 0
+    @Namespace private var roomTransitionNamespace
+
+    init(usesPersistedPlatformSelection: Bool = true) {
+        self.usesPersistedPlatformSelection = usesPersistedPlatformSelection
+    }
+
+    var body: some View {
+        playerPresentation
+            .task(id: HomeFeedRefreshTrigger(
+                installedPluginIds: pluginAvailability.installedPluginIds,
+                availabilityConfirmed: pluginAvailability.hasCheckedAvailability,
+                catalogRevision: pluginAvailability.catalogRevision,
+                credentialRevision: credentialRevision
+            )) {
+                let installedPluginIds = pluginAvailability.installedPluginIds
+                let availabilityConfirmed = pluginAvailability.hasCheckedAvailability
+                viewModel.selectPlatform(pluginId: persistedPluginId)
+                async let favoriteRefresh: Void = refreshFavoritesIfNeeded()
+                let context = await PluginHomeFeedRefreshContext.current(for: installedPluginIds)
+                guard !Task.isCancelled else {
+                    _ = await favoriteRefresh
+                    return
+                }
+                async let feedRefresh: Void = viewModel.refresh(
+                    installedPluginIds: installedPluginIds,
+                    availabilityConfirmed: availabilityConfirmed,
+                    context: context
+                )
+                _ = await (feedRefresh, favoriteRefresh)
+                viewModel.selectPlatform(pluginId: persistedPluginId)
+
+                if usesPersistedPlatformSelection {
+                    let normalizedPluginId = viewModel.selectedPluginId ?? ""
+                    if normalizedPluginId != selectedPluginId {
+                        selectedPluginId = normalizedPluginId
+                    }
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(for: .platformSessionMetadataDidChange)
+                    .compactMap { $0.object as? String }
+                    .receive(on: RunLoop.main)
+            ) { pluginId in
+                if pluginAvailability.installedPluginIds.contains(pluginId) {
+                    credentialRevision &+= 1
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(for: .platformAPICredentialChanged)
+                    .compactMap { $0.object as? String }
+                    .receive(on: RunLoop.main)
+            ) { pluginId in
+                if pluginAvailability.installedPluginIds.contains(pluginId) {
+                    credentialRevision &+= 1
+                }
+            }
+            .onChange(of: selectedPluginId) { _, _ in
+                if usesPersistedPlatformSelection {
+                    viewModel.selectPlatform(pluginId: persistedPluginId)
+                }
+            }
+    }
+}
+
+private extension HomeView {
+    var persistedPluginId: String? {
+        guard usesPersistedPlatformSelection else { return nil }
+        return selectedPluginId.isEmpty ? nil : selectedPluginId
+    }
+
+    @ViewBuilder
+    var playerPresentation: some View {
+        if #available(iOS 18.0, *) {
+            homeNavigation
+                .fullScreenCover(isPresented: playerPresentedBinding) {
+                    playerDestination
+                }
+        } else {
+            homeNavigation
+        }
+    }
+
+    var homeNavigation: some View {
+        NavigationStack {
+            GeometryReader { geometry in
+                homeNavigationContent(
+                    containerSize: geometry.size,
+                    backgroundTopExtension: geometry.safeAreaInsets.top
+                )
+                .overlay(alignment: .top) {
+                    if #available(iOS 26, *) {
+                        LiquidRefreshIndicator(
+                            pullDistance: homeNavigationModel.pullDistance,
+                            isRefreshing: isPullRefreshing,
+                            refreshCycle: refreshCycle
+                        )
+                    }
+                }
+            }
+            .fullUITabBarVisibilityRoot()
+        }
+    }
+
+    @ViewBuilder
+    func homeNavigationContent(containerSize: CGSize, backgroundTopExtension: CGFloat) -> some View {
+        let showsNavigationTitle = homeNavigationModel.scrollOffset > 0.5
+        let content = homeScrollView(containerSize: containerSize, backgroundTopExtension: backgroundTopExtension)
+            .navigationTitle(showsNavigationTitle ? "首页" : "")
+            .navigationBarTitleDisplayMode(.inline)
+            // Keep the native bar's geometry stable while its title/background
+            // change; hiding the bar itself would feed inset changes back into
+            // the scroll offset used to decide visibility.
+            .toolbar(.visible, for: .navigationBar)
+            .homeNavigationEdgeEffect(isScrolled: showsNavigationTitle)
+
+        if #available(iOS 18.0, *) {
+            content
+        } else {
+            content
+                .navigationDestination(isPresented: playerPresentedBinding) {
+                    playerDestination
+                        .toolbar(.hidden, for: .navigationBar)
+                }
+        }
+    }
+
+    var visibleSectionIDs: Set<String> {
+        Set(
+            viewModel.sectionEntries.map(HomeNavigationSectionID.plugin)
+                + (favoriteModel.roomList.isEmpty ? [] : [HomeNavigationSectionID.favorites])
+        )
+    }
+
+    func homeScrollView(containerSize: CGSize, backgroundTopExtension: CGFloat) -> some View {
+        let containerWidth = containerSize.width
+        let featuredCardWidth = featuredRoomCardWidth(for: containerWidth)
+        let compactCardWidth = compactRoomCardWidth(for: containerWidth)
+        // Use the selection/catalog, not the number of completed requests, so
+        // a slow source cannot switch the aggregate feed between rails and grid.
+        let showsSingleSource = viewModel.selectedPluginId != nil || viewModel.platformOptions.count == 1
+        let gridColumnCount = showsSingleSource ? homeGridColumnCount(for: containerWidth) : nil
+        let pluginCardWidth = gridColumnCount.map { columns in
+            (containerWidth - AppConstants.Spacing.xl * 2
+                - AppConstants.Spacing.md * CGFloat(columns - 1)) / CGFloat(columns)
+        } ?? featuredCardWidth
+        let hasConfiguredHomeSources = !pluginAvailability.installedPluginIds.isEmpty
+        let isAwaitingFirstContent = viewModel.bannerEntries.isEmpty
+            && viewModel.sectionEntries.isEmpty
+            && (
+                !pluginAvailability.hasCheckedAvailability
+                    || pluginAvailability.isChecking
+                    || (hasConfiguredHomeSources && !viewModel.hasRestoredCache)
+                    || (hasConfiguredHomeSources && !viewModel.hasLoaded)
+            )
+
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 28) {
+                if !viewModel.bannerEntries.isEmpty {
+                    HomeHeroCarousel(
+                        entries: viewModel.bannerEntries,
+                        containerSize: containerSize,
+                        backgroundTopExtension: backgroundTopExtension,
+                        metrics: homeNavigationModel,
+                        onOpenRoom: { room in
+                            openRoom(room, rooms: [room], mode: .direct)
+                        }
+                    )
+                } else if isAwaitingFirstContent {
+                    HomeHeroLoadingCard(containerSize: containerSize)
+                } else {
+                    HomeCompactHeader()
+                }
+
+                if !favoriteModel.roomList.isEmpty {
+                    HomeFavoriteSection(
+                        rooms: Array(favoriteModel.roomList.prefix(10)),
+                        isRefreshing: favoriteModel.isFavoriteStatusRefreshing,
+                        cardWidth: featuredCardWidth,
+                        namespace: roomTransitionNamespace,
+                        onSelect: { room, rooms in
+                            openRoom(room, rooms: rooms, mode: .local)
+                        }
+                    )
+                    .padding(.top, HomeNavigationMetrics.heroSectionSpacingAdjustment)
+                    .trackHomeNavigationSection(
+                        id: HomeNavigationSectionID.favorites,
+                        title: "我的收藏",
+                        onPositionChange: homeNavigationModel.updateSectionPosition
+                    )
+                }
+
+                if let firstPluginSection = viewModel.sectionEntries.first,
+                   !firstPluginSection.section.items.isEmpty {
+                    HomePluginRoomSection(
+                        entry: firstPluginSection,
+                        cardWidth: pluginCardWidth,
+                        gridColumnCount: gridColumnCount,
+                        namespace: roomTransitionNamespace,
+                        onSelect: { room, rooms, sourceID in
+                            openRoom(room, rooms: rooms, mode: .direct, transitionSourceID: sourceID)
+                        }
+                    )
+                    .padding(
+                        .top,
+                        favoriteModel.roomList.isEmpty
+                            ? HomeNavigationMetrics.heroSectionSpacingAdjustment
+                            : 0
+                    )
+                    .trackHomeNavigationSection(
+                        id: HomeNavigationSectionID.plugin(firstPluginSection),
+                        title: firstPluginSection.section.title,
+                        onPositionChange: homeNavigationModel.updateSectionPosition
+                    )
+                }
+
+                ForEach(viewModel.sectionEntries.dropFirst()) { entry in
+                    HomePluginRoomSection(
+                        entry: entry,
+                        cardWidth: pluginCardWidth,
+                        gridColumnCount: gridColumnCount,
+                        namespace: roomTransitionNamespace,
+                        onSelect: { room, rooms, sourceID in
+                            openRoom(room, rooms: rooms, mode: .direct, transitionSourceID: sourceID)
+                        }
+                    )
+                    .trackHomeNavigationSection(
+                        id: HomeNavigationSectionID.plugin(entry),
+                        title: entry.section.title,
+                        onPositionChange: homeNavigationModel.updateSectionPosition
+                    )
+                }
+
+                if isAwaitingFirstContent {
+                    HomeRoomSectionsLoading(
+                        featuredCardWidth: featuredCardWidth,
+                        compactCardWidth: compactCardWidth
+                    )
+                    .padding(.top, favoriteModel.roomList.isEmpty ? -44 : 0)
+                }
+
+                if viewModel.hasLoaded,
+                   pluginAvailability.hasCheckedAvailability,
+                   !pluginAvailability.isChecking,
+                   pluginAvailability.installedPluginIds.isEmpty {
+                    HomeConfigurationGuide()
+                }
+
+                if !viewModel.failedPluginNames.isEmpty {
+                    HomeFeedFailureCard(
+                        pluginNames: viewModel.failedPluginNames,
+                        isRefreshing: viewModel.isRefreshing,
+                        retry: refreshHome
+                    )
+                }
+            }
+            .padding(.bottom, 128)
+            .background {
+                HomeScrollOffsetProbe(onChange: homeNavigationModel.updateScrollMetrics,
+                                      releaseGate: homeNavigationModel.refreshGate)
+                    .frame(width: 0, height: 0)
+            }
+            .background {
+                FullUIArcRefreshIndicator(
+                    isEnabled: pluginAvailability.hasAvailablePlugins,
+                    isRefreshing: isPullRefreshing
+                )
+                .frame(width: 0, height: 0)
+            }
+        }
+        .background(AppConstants.Colors.primaryBackground)
+        .refreshable {
+            if #available(iOS 26, *) {
+                guard await homeNavigationModel.refreshGate.waitForRelease() else { return }
+            }
+            await refreshAll()
+        }
+        .navigationDestination(for: HomeCategoryRoute.self) { route in
+            HomeCategoryView(
+                route: route,
+                navigationState: navigationState,
+                namespace: roomTransitionNamespace
+            )
+            .apiCredentialContentIdentity(pluginId: route.pluginId)
+        }
+    }
+
+    func featuredRoomCardWidth(for containerWidth: CGFloat) -> CGFloat {
+        min(max((containerWidth - 52) / 1.72, 164), 300)
+    }
+
+    func homeGridColumnCount(for containerWidth: CGFloat) -> Int {
+        if dynamicTypeSize.isAccessibilitySize || containerWidth < 350 { return 1 }
+        return max(2, Int(containerWidth / 250))
+    }
+
+    func compactRoomCardWidth(for containerWidth: CGFloat) -> CGFloat {
+        min(max((containerWidth - 56) / 2.05, 156), 240)
+    }
+
+    var playerPresentedBinding: Binding<Bool> {
+        Binding(
+            get: { navigationState.showPlayer },
+            set: { isPresented in
+                if !isPresented { navigationState.dismiss() }
+            }
+        )
+    }
+
+    @ViewBuilder
+    var playerDestination: some View {
+        if let room = navigationState.currentRoom {
+            DetailPlayerView(
+                viewModel: RoomInfoViewModel(room: room),
+                categoryRooms: navigationState.categoryRooms
+            )
+            .modifier(
+                ZoomTransitionModifier(
+                    sourceID: navigationState.transitionSourceID ?? room.roomId,
+                    namespace: roomTransitionNamespace
+                )
+            )
+            .fullUITabBarHidden()
+        }
+    }
+
+    func openRoom(_ room: LiveModel, rooms: [LiveModel], mode: HomeRoomOpenMode, transitionSourceID: String? = nil) {
+        switch mode {
+        case .direct:
+            navigationState.navigate(to: room, categoryRooms: rooms, transitionSourceID: transitionSourceID)
+        case .local:
+            if room.liveState == LiveState.close.rawValue {
+                presentToast(ToastValue(icon: Image(systemName: "tv.slash"), message: "主播已下播"))
+            } else {
+                navigationState.navigate(to: room, categoryRooms: rooms, transitionSourceID: transitionSourceID)
+            }
+        }
+    }
+
+    @MainActor
+    func refreshFavoritesIfNeeded() async {
+        if favoriteModel.shouldSync() {
+            await favoriteModel.syncWithActor()
+        }
+    }
+
+    func refreshHome() {
+        Task {
+            let installedPluginIds = pluginAvailability.installedPluginIds
+            let context = await PluginHomeFeedRefreshContext.current(for: installedPluginIds)
+            guard !Task.isCancelled else { return }
+            await viewModel.refresh(
+                installedPluginIds: installedPluginIds,
+                availabilityConfirmed: pluginAvailability.hasCheckedAvailability,
+                context: context,
+                force: true
+            )
+        }
+    }
+
+    @MainActor
+    func refreshAll() async {
+        guard !isPullRefreshing else { return }
+        isPullRefreshing = true
+        refreshCycle += 1
+        defer { isPullRefreshing = false }
+        let installedPluginIds = pluginAvailability.installedPluginIds
+        let context = await PluginHomeFeedRefreshContext.current(for: installedPluginIds)
+        guard !Task.isCancelled else { return }
+        await viewModel.refresh(
+            installedPluginIds: installedPluginIds,
+            availabilityConfirmed: pluginAvailability.hasCheckedAvailability,
+            context: context,
+            force: true
+        )
+        await favoriteModel.pullToRefresh()
+    }
+}
+
+private enum HomeRoomOpenMode {
+    case direct
+    case local
+}
+
+private struct HomeFeedRefreshTrigger: Hashable {
+    let installedPluginIds: [String]
+    let availabilityConfirmed: Bool
+    let catalogRevision: UInt
+    let credentialRevision: Int
+}
+
+private enum HomeNavigationMetrics {
+    static let barHeight: CGFloat = 44
+    static let fadeDistance: CGFloat = 96
+    /// The stack contributes 28 points between the hero and its first rail.
+    /// Pull back 20 so the title groups remain distinct without leaving a
+    /// large empty band below the banner.
+    static let heroSectionSpacingAdjustment: CGFloat = -20
+}
+
+private enum HomeHeroLayout {
+    static func cardHeight(for containerSize: CGSize) -> CGFloat {
+        let preferredHeight = min(max(containerSize.width * 0.9, 336), 500)
+        return min(preferredHeight, max(180, containerSize.height * 0.5))
+    }
+}
+
+private enum HomeNavigationSectionID {
+    static let favorites = "favorites"
+
+    static func plugin(_ entry: HomeSectionEntry) -> String {
+        "plugin:\(entry.pluginId):\(entry.id)"
+    }
+}
+
+/// Reports the enclosing scroll view's travel without going through
+/// `GeometryProxy`. A proxy measured next to `ignoresSafeArea` anchors to the
+/// pre-expansion layout frame, so its resting value silently carries the top
+/// safe-area inset; `contentOffset` relative to `adjustedContentInset` is
+/// exact and stays correct when the refresh control changes the inset mid
+/// gesture.
+private struct HomeScrollOffsetProbe: UIViewRepresentable {
+    let onChange: (CGFloat, CGFloat) -> Void
+    let releaseGate: PullRefreshReleaseGate
+
+    func makeUIView(context: Context) -> HomeScrollOffsetProbeView {
+        HomeScrollOffsetProbeView(onChange: onChange, releaseGate: releaseGate)
+    }
+
+    func updateUIView(_ uiView: HomeScrollOffsetProbeView, context: Context) {
+        uiView.onChange = onChange
+    }
+}
+
+private final class HomeScrollOffsetProbeView: UIView {
+    var onChange: (CGFloat, CGFloat) -> Void
+    private let releaseGate: PullRefreshReleaseGate
+
+    private weak var observedScrollView: UIScrollView?
+    private var offsetObservation: NSKeyValueObservation?
+    private var insetObservation: NSKeyValueObservation?
+
+    init(onChange: @escaping (CGFloat, CGFloat) -> Void, releaseGate: PullRefreshReleaseGate) {
+        self.onChange = onChange
+        self.releaseGate = releaseGate
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard window != nil else {
+            stopObserving()
+            return
+        }
+        startObserving()
+    }
+
+    private func startObserving() {
+        guard let scrollView = enclosingScrollView(), scrollView !== observedScrollView else {
+            return
+        }
+
+        stopObserving()
+        observedScrollView = scrollView
+        releaseGate.scrollView = scrollView
+
+        offsetObservation = scrollView.observe(
+            \.contentOffset,
+            options: [.initial, .new]
+        ) { [weak self] scrollView, _ in
+            MainActor.assumeIsolated {
+                self?.report(for: scrollView)
+            }
+        }
+
+        // The refresh control installs its own top inset once a pull begins.
+        // Without this the reported travel would jump by that inset instead of
+        // staying continuous.
+        insetObservation = scrollView.observe(
+            \.adjustedContentInset,
+            options: [.new]
+        ) { [weak self] scrollView, _ in
+            MainActor.assumeIsolated {
+                self?.report(for: scrollView)
+            }
+        }
+    }
+
+    private func stopObserving() {
+        releaseGate.scrollView = nil
+        offsetObservation = nil
+        insetObservation = nil
+        observedScrollView = nil
+    }
+
+    private func report(for scrollView: UIScrollView) {
+        // Remove only UIKit's safe-area/bar adjustment. The refresh control's
+        // contentInset still contributes real travel while its request runs.
+        let systemTopAdjustment = scrollView.adjustedContentInset.top - scrollView.contentInset.top
+        onChange(
+            scrollView.contentOffset.y + scrollView.adjustedContentInset.top,
+            -scrollView.contentOffset.y - systemTopAdjustment
+        )
+    }
+
+    private func enclosingScrollView() -> UIScrollView? {
+        var candidate = superview
+        while let view = candidate {
+            if let scrollView = view as? UIScrollView {
+                return scrollView
+            }
+            candidate = view.superview
+        }
+        return nil
+    }
+}
+
+private struct HomeNavigationSectionPosition: Equatable {
+    let id: String
+    let title: String
+    let minY: CGFloat
+}
+
+@MainActor
+@Observable
+private final class HomeNavigationModel {
+    @ObservationIgnored let refreshGate = PullRefreshReleaseGate()
+    /// Travel from the feed's resting position: zero at rest, positive while
+    /// scrolled up. Measured against `adjustedContentInset` so the bar does not
+    /// flicker when the refresh control installs its own inset.
+    private(set) var scrollOffset: CGFloat = 0
+
+    /// How far the first content item currently sits below the scroll view's
+    /// safe content edge. Strip UIKit's system adjustment from `-contentOffset.y`,
+    /// while preserving the refresh control's dynamic `contentInset` contribution.
+    /// This is zero at rest even when a bar or safe area contributes a top inset.
+    private(set) var contentTopOffset: CGFloat = 0
+
+    private(set) var sectionPositions: [String: HomeNavigationSectionPosition] = [:]
+
+    var progress: CGFloat {
+        min(max(scrollOffset / HomeNavigationMetrics.fadeDistance, 0), 1)
+    }
+
+    var pullDistance: CGFloat {
+        max(contentTopOffset, 0)
+    }
+
+    func title(visibleSectionIDs: Set<String>, activationY: CGFloat) -> String {
+        sectionPositions.values
+            .filter { visibleSectionIDs.contains($0.id) && $0.minY <= activationY }
+            .max(by: { $0.minY < $1.minY })?
+            .title ?? "首页"
+    }
+
+    func updateScrollMetrics(offset: CGFloat, contentTop: CGFloat) {
+        if abs(scrollOffset - offset) >= 0.5 {
+            scrollOffset = offset
+        }
+        if abs(contentTopOffset - contentTop) >= 0.5 {
+            contentTopOffset = contentTop
+        }
+    }
+
+    func updateSectionPosition(id: String, title: String, minY: CGFloat) {
+        let position = HomeNavigationSectionPosition(id: id, title: title, minY: minY)
+        guard let previous = sectionPositions[id] else {
+            sectionPositions[id] = position
+            return
+        }
+        guard previous.title != title || abs(previous.minY - minY) >= 4 else { return }
+        sectionPositions[id] = position
+    }
+}
+
+private extension View {
+    func trackHomeNavigationSection(
+        id: String,
+        title: String,
+        onPositionChange: @escaping (String, String, CGFloat) -> Void
+    ) -> some View {
+        onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.frame(in: .global).minY
+        } action: { minY in
+            onPositionChange(id, title, minY)
+        }
+    }
+}
+
+private struct HomeRoomPresentation: Identifiable {
+    let id: String
+    let room: LiveModel
+    let reason: String?
+    let transitionSourceID: String?
+
+    init(id: String? = nil, room: LiveModel, reason: String? = nil, transitionSourceID: String? = nil) {
+        self.id = id ?? room.id
+        self.room = room
+        self.reason = reason
+        self.transitionSourceID = transitionSourceID
+    }
+}
+
+private struct HomeFavoriteSection: View {
+    let rooms: [LiveModel]
+    let isRefreshing: Bool
+    let cardWidth: CGFloat
+    let namespace: Namespace.ID
+    let onSelect: (LiveModel, [LiveModel]) -> Void
+
+    var body: some View {
+        HomeRoomSection(
+            title: "我的收藏",
+            subtitle: isRefreshing ? "状态更新中" : nil,
+            items: rooms.map { HomeRoomPresentation(room: $0) },
+            cardWidth: cardWidth,
+            emptyMessage: "收藏常看的直播间，之后可以从这里快速进入",
+            emptySystemImage: "heart",
+            trailing: {
+                NavigationLink {
+                    FavoriteView(embeddedInNavigationStack: true)
+                        .toolbar(.visible, for: .navigationBar)
+                } label: {
+                    HomeSeeAllLabel()
+                }
+            },
+            onSelect: { item in onSelect(item.room, rooms) },
+            namespace: namespace
+        )
+    }
+}
+
+private struct HomePluginRoomSection: View {
+    let entry: HomeSectionEntry
+    let cardWidth: CGFloat
+    let gridColumnCount: Int?
+    let namespace: Namespace.ID
+    let onSelect: (LiveModel, [LiveModel], String?) -> Void
+
+    private var rooms: [LiveModel] {
+        entry.section.items.map(\.room)
+    }
+
+    private var subtitle: String {
+        let source = entry.section.personalized
+            ? "为你推荐 · 来自 \(entry.pluginDisplayName)"
+            : "来自 \(entry.pluginDisplayName)"
+        guard let subtitle = entry.section.subtitle, !subtitle.isEmpty else {
+            return source
+        }
+        return "\(subtitle) · \(source)"
+    }
+
+    private var route: HomeCategoryRoute? {
+        entry.section.seeAllTarget.map {
+            HomeCategoryRoute(
+                pluginId: entry.pluginId,
+                liveType: entry.liveType,
+                category: $0,
+                fallbackTitle: entry.section.title
+            )
+        }
+    }
+
+    var body: some View {
+        HomeRoomSection(
+            title: entry.section.title,
+            subtitle: subtitle,
+            items: entry.section.items.map {
+                HomeRoomPresentation(
+                    id: $0.id,
+                    room: $0.room,
+                    reason: $0.reason,
+                    transitionSourceID: "home-item:\($0.id)"
+                )
+            },
+            cardWidth: cardWidth,
+            gridColumnCount: gridColumnCount,
+            trailing: {
+                if let route {
+                    NavigationLink(value: route) {
+                        HomeSeeAllLabel()
+                    }
+                }
+            },
+            onSelect: { item in onSelect(item.room, rooms, item.transitionSourceID) },
+            namespace: namespace
+        )
+    }
+}
+
+private struct HomeRoomSection<Trailing: View>: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var measuredRailHeight: CGFloat = 0
+
+    let title: String
+    let subtitle: String?
+    let items: [HomeRoomPresentation]
+    let cardWidth: CGFloat
+    let gridColumnCount: Int?
+    let emptyMessage: String?
+    let emptySystemImage: String
+    let trailing: Trailing
+    let onSelect: (HomeRoomPresentation) -> Void
+    let namespace: Namespace.ID
+
+    init(
+        title: String,
+        subtitle: String?,
+        items: [HomeRoomPresentation],
+        cardWidth: CGFloat,
+        gridColumnCount: Int? = nil,
+        emptyMessage: String? = nil,
+        emptySystemImage: String = "rectangle.stack",
+        @ViewBuilder trailing: () -> Trailing,
+        onSelect: @escaping (HomeRoomPresentation) -> Void,
+        namespace: Namespace.ID
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.items = items
+        self.cardWidth = cardWidth
+        self.gridColumnCount = gridColumnCount
+        self.emptyMessage = emptyMessage
+        self.emptySystemImage = emptySystemImage
+        self.trailing = trailing()
+        self.onSelect = onSelect
+        self.namespace = namespace
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AppConstants.Spacing.md) {
+            HomeSectionHeader(title: title, subtitle: subtitle) {
+                trailing
+            }
+
+            if items.isEmpty, let emptyMessage {
+                HomeEmptyRail(message: emptyMessage, systemImage: emptySystemImage)
+            } else if let gridColumnCount {
+                LazyVGrid(
+                    columns: Array(
+                        repeating: GridItem(.fixed(cardWidth), spacing: AppConstants.Spacing.md, alignment: .top),
+                        count: gridColumnCount
+                    ),
+                    alignment: .leading,
+                    spacing: AppConstants.Spacing.xl
+                ) {
+                    ForEach(items) { item in
+                        roomButton(for: item)
+                    }
+                }
+                .padding(.horizontal, AppConstants.Spacing.xl)
+            } else {
+                roomScroll
+            }
+        }
+    }
+
+    private var roomScroll: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(alignment: .top, spacing: AppConstants.Spacing.md) {
+                ForEach(items) { item in
+                    roomButton(for: item)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                            // Lazy horizontal layout can size itself from a short
+                            // first card. Keep room for the tallest measured card
+                            // so longer titles and streamer names remain visible.
+                            measuredRailHeight = max(measuredRailHeight, height)
+                        }
+                }
+            }
+            .padding(.horizontal, AppConstants.Spacing.xl)
+        }
+        .frame(minHeight: measuredRailHeight)
+        .clipped()
+        .scrollIndicators(.hidden)
+        .onChange(of: cardWidth) { _, _ in measuredRailHeight = 0 }
+        .onChange(of: dynamicTypeSize) { _, _ in measuredRailHeight = 0 }
+        .onChange(of: items.map(\.id)) { _, _ in measuredRailHeight = 0 }
+    }
+
+    private func roomButton(for item: HomeRoomPresentation) -> some View {
+        Button {
+            onSelect(item)
+        } label: {
+            LiveRoomCard(
+                room: item.room,
+                width: cardWidth,
+                liveCheckMode: .none,
+                presentation: .home,
+                recommendationReason: item.reason,
+                disableTapGesture: true,
+                transitionSourceID: item.transitionSourceID
+            )
+            .environment(\.roomTransitionNamespace, namespace)
+        }
+        .buttonStyle(HomeCardButtonStyle())
+        .accessibilityLabel("\(RoomTitleTranslationService.shared.displayTitle(for: item.room.roomTitle))，\(item.room.userName)")
+        .accessibilityHint("打开播放页")
+    }
+}
+
+private struct HomeSectionHeader<Trailing: View>: View {
+    let title: String
+    let subtitle: String?
+    let trailing: Trailing
+
+    init(
+        title: String,
+        subtitle: String?,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.trailing = trailing()
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: AppConstants.Spacing.md) {
+            VStack(alignment: .leading, spacing: AppConstants.Spacing.xs) {
+                Text(title)
+                    .font(.title3.weight(.bold))
+                    .foregroundStyle(AppConstants.Colors.primaryText)
+
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(AppConstants.Colors.secondaryText)
+                        .lineLimit(2)
+                }
+            }
+
+            Spacer(minLength: AppConstants.Spacing.sm)
+            trailing
+        }
+        .padding(.horizontal, AppConstants.Spacing.xl)
+    }
+}
+
+private struct HomeEmptyRail: View {
+    let message: String
+    let systemImage: String
+
+    var body: some View {
+        HStack(spacing: AppConstants.Spacing.md) {
+            Image(systemName: systemImage)
+                .font(.title3)
+                .foregroundStyle(AppConstants.Colors.tertiaryText)
+                .frame(width: 34, height: 34)
+
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(AppConstants.Colors.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, AppConstants.Spacing.xl)
+        .frame(minHeight: 58)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct HomeSeeAllLabel: View {
+    var body: some View {
+        HStack(spacing: AppConstants.Spacing.xs) {
+            Text("全部")
+            Image(systemName: "chevron.right")
+                .font(.caption.bold())
+        }
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(AppConstants.Colors.secondaryText)
+        .frame(minHeight: 44)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct HomeHeroCarousel: View {
+    let entries: [HomeBannerEntry]
+    let containerSize: CGSize
+    let backgroundTopExtension: CGFloat
+    let metrics: HomeNavigationModel
+    let onOpenRoom: (LiveModel) -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var selectedPageID: Int? = 1
+    @State private var currentBannerID: String?
+    @State private var isScrolling = false
+    @State private var needsLayoutCorrection = false
+    @State private var layoutCorrectionTask: Task<Void, Never>?
+    @State private var layoutGeneration = 0
+    @State private var autoplayProgress: CGFloat = 1
+    @State private var pageIndicatorWidth: CGFloat = 72
+
+    private let pageInset: CGFloat = 0
+    private let cardSpacing: CGFloat = 0
+    private let autoplayInterval: TimeInterval = 6
+
+    private var viewportWidth: CGFloat {
+        containerSize.width
+    }
+
+    private var cardWidth: CGFloat {
+        viewportWidth
+    }
+
+    private var cardHeight: CGFloat {
+        HomeHeroLayout.cardHeight(for: containerSize)
+    }
+
+    private var viewportSize: CGSize {
+        CGSize(width: viewportWidth, height: cardHeight)
+    }
+
+    private var pullExtension: CGFloat {
+        reduceMotion ? 0 : metrics.pullDistance
+    }
+
+    private var displayedCardHeight: CGFloat {
+        cardHeight + pullExtension
+    }
+
+    private var isPulling: Bool {
+        metrics.pullDistance > 1
+    }
+
+    private var loopPages: [HomeHeroLoopPage] {
+        guard !entries.isEmpty else { return [] }
+        let index = entries.firstIndex { $0.id == currentBannerID } ?? 0
+        guard entries.count > 1 else {
+            return [HomeHeroLoopPage(id: 1, entry: entries[index])]
+        }
+        // Keep three fully laid-out pages. Every entry remains reachable;
+        // only the rendering window moves after scrolling has stopped.
+        return [
+            HomeHeroLoopPage(id: 0, entry: entries[(index + entries.count - 1) % entries.count]),
+            HomeHeroLoopPage(id: 1, entry: entries[index]),
+            HomeHeroLoopPage(id: 2, entry: entries[(index + 1) % entries.count])
+        ]
+    }
+
+    private var selectedBannerID: String? {
+        guard let selectedPageID else { return nil }
+        return loopPages.first(where: { $0.id == selectedPageID })?.entry.id
+    }
+
+    private var backdropEntry: HomeBannerEntry? {
+        if let selectedBannerID,
+           let entry = entries.first(where: { $0.id == selectedBannerID }) {
+            return entry
+        }
+        if let currentBannerID,
+           let entry = entries.first(where: { $0.id == currentBannerID }) {
+            return entry
+        }
+        return loopPages.first(where: { $0.id == 1 })?.entry
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if #available(iOS 26.0, *), let backdropEntry {
+                HomeHeroBackdrop(
+                    preferredImageURL: backdropEntry.preferredHeroImageURL,
+                    fallbackImageURL: backdropEntry.fallbackHeroImageURL,
+                    cardWidth: viewportWidth,
+                    cardHeight: displayedCardHeight + backgroundTopExtension,
+                    imageDecodeHeight: cardHeight,
+                    backgroundTopExtension: backgroundTopExtension,
+                    presentationScale: reduceMotion ? 1 : 1.1
+                )
+                // Only the backdrop extends above the scroll content's safe origin.
+                // The bottom-aligned frame preserves the foreground's exact bounds.
+                .frame(width: viewportWidth, height: displayedCardHeight + backgroundTopExtension)
+                .backgroundExtensionEffect()
+                .frame(height: displayedCardHeight, alignment: .bottom)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+
+            ScrollViewReader { scrollProxy in
+                ScrollView(.horizontal) {
+                    HStack(spacing: cardSpacing) {
+                        ForEach(loopPages) { page in
+                            heroPage(for: page.entry)
+                                .id(page.entry.id)
+                                .frame(width: viewportWidth, height: displayedCardHeight)
+                                .id(page.id)
+                        }
+                    }
+                    .scrollTargetLayout()
+                    .background {
+                        HomeHeroScrollActivityProbe(onChange: scrollingChanged)
+                            .frame(width: 0, height: 0)
+                    }
+                }
+                .scrollPosition(id: $selectedPageID, anchor: .center)
+                .scrollTargetBehavior(.paging)
+                .scrollIndicators(.hidden)
+                .frame(width: viewportWidth, height: displayedCardHeight)
+                .clipped()
+                // Keep the opaque viewport fill from covering the artwork's
+                // background extension in the surrounding safe area.
+                .background(AppConstants.Colors.primaryBackground, ignoresSafeAreaEdges: [])
+                .onChange(of: viewportSize) { oldSize, newSize in
+                    guard abs(oldSize.width - newSize.width) > 0.5
+                            || abs(oldSize.height - newSize.height) > 0.5
+                    else { return }
+                    scheduleLayoutCorrection(using: scrollProxy)
+                }
+                .onChange(of: isScrolling) { _, active in
+                    if !active && needsLayoutCorrection {
+                        scheduleLayoutCorrection(using: scrollProxy)
+                    }
+                }
+            }
+
+            if entries.count > 1 {
+                HomeHeroPageIndicator(
+                    entries: entries,
+                    selectedID: selectedBannerID,
+                    progress: autoplayProgress
+                )
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { pageIndicatorWidth = $0 }
+                    .padding(.trailing, AppConstants.Spacing.xxl)
+                    .padding(.bottom, AppConstants.Spacing.xxl)
+            }
+        }
+        // Extend the image viewport, rather than distorting the entire page.
+        // Counter-offset tracks the live scroll through refresh and settling;
+        // the outer layout height stays fixed, so this cannot feed back into it.
+        .frame(height: displayedCardHeight, alignment: .top)
+        .offset(y: -pullExtension)
+        .frame(height: cardHeight, alignment: .top)
+        .frame(maxWidth: .infinity)
+        .onAppear(perform: normalizeSelection)
+        .onChange(of: entries.map(\.id)) { _, _ in normalizeSelection() }
+        .onChange(of: selectedPageID) { _, _ in
+            settleSelectionIfNeeded()
+        }
+        .onDisappear {
+            layoutCorrectionTask?.cancel()
+        }
+        .task(id: autoplayTaskID) {
+            await runAutoplayIfNeeded()
+        }
+    }
+
+    private var autoplayTaskID: String {
+        "\(entries.map(\.id).joined(separator: "|"))::\(currentBannerID ?? "")::\(scenePhase)::\(reduceMotion)::\(isScrolling)::\(isPulling)::\(needsLayoutCorrection)::\(layoutGeneration)"
+    }
+
+    private func normalizeSelection() {
+        guard !entries.contains(where: { $0.id == currentBannerID }) else { return }
+        layoutCorrectionTask?.cancel()
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            currentBannerID = entries.first?.id
+            selectedPageID = entries.isEmpty ? nil : 1
+        }
+    }
+
+    private func scrollingChanged(_ active: Bool) {
+        isScrolling = active
+        if active {
+            layoutCorrectionTask?.cancel()
+        } else if !needsLayoutCorrection {
+            settleSelectionIfNeeded()
+        }
+    }
+
+    private func settleSelectionIfNeeded() {
+        guard !isScrolling, !needsLayoutCorrection,
+              selectedPageID != 1,
+              let bannerID = selectedBannerID else { return }
+        // Rebase the content and offset in one nonanimated transaction. The
+        // visible banner stays identical; there is no distant lazy-stack jump.
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            currentBannerID = bannerID
+            selectedPageID = 1
+        }
+    }
+
+    private func scheduleLayoutCorrection(using scrollProxy: ScrollViewProxy) {
+        layoutCorrectionTask?.cancel()
+        needsLayoutCorrection = true
+        guard !isScrolling else { return }
+
+        layoutCorrectionTask = Task { @MainActor in
+            // Rotation and Stage Manager resizing can publish a short series
+            // of intermediate sizes. Re-anchor only after that burst settles.
+            do {
+                try await Task.sleep(for: .milliseconds(120))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, !isScrolling, !entries.isEmpty else { return }
+
+            let bannerID = selectedBannerID.flatMap { selectedID in
+                entries.contains(where: { $0.id == selectedID }) ? selectedID : nil
+            } ?? entries[0].id
+
+            // Re-anchor explicitly even when the selected ID is still 1.
+            // A binding reset can be coalesced while the viewport resizes,
+            // leaving the previous display's pixel offset between two pages.
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                currentBannerID = bannerID
+                selectedPageID = 1
+                scrollProxy.scrollTo(1, anchor: .center)
+                needsLayoutCorrection = false
+                layoutGeneration &+= 1
+            }
+        }
+    }
+
+    @MainActor
+    private func runAutoplayIfNeeded() async {
+        let canAutoplay = entries.count > 1 && scenePhase == .active && !reduceMotion
+            && !isScrolling && !isPulling && !needsLayoutCorrection
+        var resetTransaction = Transaction()
+        resetTransaction.disablesAnimations = true
+        withTransaction(resetTransaction) {
+            autoplayProgress = canAutoplay ? 0 : 1
+        }
+
+        guard canAutoplay else { return }
+        await Task.yield()
+        guard !Task.isCancelled else { return }
+        withAnimation(.linear(duration: autoplayInterval)) {
+            autoplayProgress = 1
+        }
+
+        do {
+            try await Task.sleep(for: .seconds(autoplayInterval))
+        } catch {
+            return
+        }
+
+        guard !Task.isCancelled, !isScrolling, !isPulling, !needsLayoutCorrection,
+              selectedPageID == 1 else { return }
+        // Mark motion before changing the binding so its onChange cannot
+        // rebase a programmatic page turn before the animation starts.
+        isScrolling = true
+        withAnimation(.timingCurve(0.76, 0, 0.24, 1, duration: 0.78)) {
+            selectedPageID = 2
+        }
+    }
+
+    @ViewBuilder
+    private func heroPage(for entry: HomeBannerEntry) -> some View {
+        heroDestination(for: entry)
+            .frame(width: cardWidth, height: displayedCardHeight)
+            .clipped()
+    }
+
+    @ViewBuilder
+    private func heroDestination(for entry: HomeBannerEntry) -> some View {
+        switch entry.banner.target {
+        case .room(let room):
+            Button { onOpenRoom(room) } label: {
+                HomeHeroCard(
+                    entry: entry,
+                    cardWidth: cardWidth,
+                    cardHeight: displayedCardHeight,
+                    imageDecodeHeight: cardHeight,
+                    backgroundTopExtension: backgroundTopExtension,
+                    pageInset: pageInset,
+                    cardSpacing: cardSpacing,
+                    pageIndicatorReservedWidth: entries.count > 1 ? pageIndicatorWidth + 16 : 0
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("打开播放页")
+        case .category(let category):
+            NavigationLink(
+                value: HomeCategoryRoute(
+                    pluginId: entry.pluginId,
+                    liveType: entry.liveType,
+                    category: category,
+                    fallbackTitle: entry.banner.title
+                )
+            ) {
+                HomeHeroCard(
+                    entry: entry,
+                    cardWidth: cardWidth,
+                    cardHeight: displayedCardHeight,
+                    imageDecodeHeight: cardHeight,
+                    backgroundTopExtension: backgroundTopExtension,
+                    pageInset: pageInset,
+                    cardSpacing: cardSpacing,
+                    pageIndicatorReservedWidth: entries.count > 1 ? pageIndicatorWidth + 16 : 0
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("打开分类")
+        }
+    }
+}
+
+private struct HomeHeroLoopPage: Identifiable {
+    let id: Int
+    let entry: HomeBannerEntry
+}
+
+private struct HomeHeroCard: View {
+    let entry: HomeBannerEntry
+    let cardWidth: CGFloat
+    let cardHeight: CGFloat
+    let imageDecodeHeight: CGFloat
+    let backgroundTopExtension: CGFloat
+    let pageInset: CGFloat
+    let cardSpacing: CGFloat
+    let pageIndicatorReservedWidth: CGFloat
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        // The page edge remains the moving reveal mask. Give the image a
+        // separate S-curve, with zero velocity at either end and at most 18%
+        // viewport travel; counter-translation keeps the visible region filled.
+        let imageScale: CGFloat = reduceMotion ? 1 : 1.1
+        let animatesReveal = !reduceMotion
+
+        ZStack {
+            HomeHeroRemoteImage(
+                url: entry.preferredHeroImageURL,
+                fallbackURL: entry.fallbackHeroImageURL,
+                // A stable decode size avoids a new image-processing cache key
+                // on every drag frame; only the presentation viewport grows.
+                targetSize: CGSize(width: cardWidth, height: imageDecodeHeight),
+                presentationScale: imageScale
+            )
+                .frame(width: cardWidth, height: cardHeight + backgroundTopExtension)
+                .visualEffect { content, proxy in
+                    let progress = pageProgress(
+                        for: proxy,
+                        pageInset: pageInset,
+                        pageStride: cardWidth + cardSpacing
+                    )
+                    let distance = abs(progress)
+                    let easedDistance = distance * distance * (3 - 2 * distance)
+                    let direction: CGFloat = progress < 0 ? -1 : 1
+                    let imagePosition = direction * easedDistance * 0.18
+                    return content
+                        .scaleEffect(imageScale)
+                        .offset(x: animatesReveal ? (imagePosition - progress) * cardWidth : 0)
+                }
+                // Match the backdrop's crop and scaling center before revealing
+                // only the original foreground region below the safe origin.
+                .frame(height: cardHeight, alignment: .bottom)
+
+            HomeHeroGradient()
+
+            VStack {
+                Spacer(minLength: 0)
+                HomeHeroContent(
+                    title: heroTitle,
+                    originalRoomTitle: heroOriginalRoomTitle,
+                    streamerName: streamerName,
+                    pageIndicatorReservedWidth: pageIndicatorReservedWidth
+                )
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, AppConstants.Spacing.xl)
+            .padding(.bottom, AppConstants.Spacing.xxl)
+            .visualEffect { content, proxy in
+                let progress = abs(pageProgress(
+                    for: proxy,
+                    pageInset: pageInset,
+                    pageStride: cardWidth + cardSpacing
+                ))
+                // Reveal the title near the end of the gesture. A
+                // position-driven fade reverses immediately with the finger;
+                // delayed tasks would keep running after a cancelled swipe.
+                let fraction = animatesReveal ? max(0, 1 - progress / 0.36) : 1
+                // Quintic fade and cubic settling give the text its own rhythm,
+                // without a timer that could outlive an interrupted page turn.
+                let opacity = fraction * fraction * fraction * (fraction * (6 * fraction - 15) + 10)
+                let remaining = 1 - fraction
+                return content
+                    .opacity(opacity)
+                    .offset(y: remaining * remaining * remaining * 10)
+            }
+
+        }
+        .clipped()
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityDescription)
+    }
+
+    private var heroTitle: String {
+        if case .room(let room) = entry.banner.target,
+           !room.roomTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return RoomTitleTranslationService.shared.displayTitle(for: room.roomTitle)
+        }
+        return entry.banner.title
+    }
+
+    private var heroOriginalRoomTitle: String? {
+        guard case .room(let room) = entry.banner.target,
+              !room.roomTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return room.roomTitle
+    }
+
+    private var streamerName: String? {
+        guard case .room(let room) = entry.banner.target else { return nil }
+        let value = room.userName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private var heroSubtitle: String? {
+        let value = entry.banner.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+
+    private var accessibilityDescription: String {
+        if let streamerName {
+            return "\(heroTitle)，主播 \(streamerName)"
+        }
+        return [heroTitle, heroSubtitle]
+            .compactMap { $0 }
+            .joined(separator: "，")
+    }
+
+    nonisolated private func pageProgress(
+        for proxy: GeometryProxy,
+        pageInset: CGFloat,
+        pageStride: CGFloat
+    ) -> CGFloat {
+        let pageMinX = proxy.frame(
+            in: .scrollView(axis: .horizontal)
+        ).minX - pageInset
+        return min(
+            max(pageMinX / max(pageStride, 1), -1),
+            1
+        )
+    }
+}
+
+private struct HomeHeroBackdrop: View {
+    let preferredImageURL: URL?
+    let fallbackImageURL: URL?
+    let cardWidth: CGFloat
+    let cardHeight: CGFloat
+    let imageDecodeHeight: CGFloat
+    let backgroundTopExtension: CGFloat
+    let presentationScale: CGFloat
+
+    var body: some View {
+        ZStack {
+            HomeHeroRemoteImage(
+                url: preferredImageURL,
+                fallbackURL: fallbackImageURL,
+                targetSize: CGSize(width: cardWidth, height: imageDecodeHeight),
+                presentationScale: presentationScale
+            )
+                .frame(width: cardWidth, height: cardHeight)
+                .scaleEffect(presentationScale)
+                .clipped()
+
+            VStack(spacing: 0) {
+                HomeHeroGradient.topShade
+                    .frame(height: backgroundTopExtension)
+                HomeHeroGradient()
+                    .frame(height: cardHeight - backgroundTopExtension)
+            }
+        }
+    }
+}
+
+private struct HomeHeroGradient: View {
+    static let topShade = Color.black.opacity(0.28)
+
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: Self.topShade, location: 0),
+                .init(color: .clear, location: 0.34),
+                .init(color: .clear, location: 0.54),
+                .init(color: AppConstants.Colors.primaryBackground.opacity(0.12), location: 0.60),
+                .init(color: AppConstants.Colors.primaryBackground.opacity(0.58), location: 0.73),
+                .init(color: AppConstants.Colors.primaryBackground.opacity(0.94), location: 0.86),
+                .init(color: AppConstants.Colors.primaryBackground, location: 0.96),
+                .init(color: AppConstants.Colors.primaryBackground, location: 1)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+}
+
+private extension HomeBannerEntry {
+    /// Room feeds often expose a full-resolution live cover while their
+    /// promotional banner field is only a small web thumbnail. Prefer the room
+    /// cover and retain the promotional artwork as a network fallback.
+    var preferredHeroImageURL: URL? {
+        guard case .room(let room) = banner.target,
+              !room.roomCover.isEmpty,
+              let roomCoverURL = URL(string: room.roomCover)
+        else {
+            return banner.imageURL
+        }
+
+        return roomCoverURL
+    }
+
+    var fallbackHeroImageURL: URL? {
+        guard preferredHeroImageURL != banner.imageURL else { return nil }
+        return banner.imageURL
+    }
+}
+
+private struct HomeHeroContent: View {
+    let title: String
+    let originalRoomTitle: String?
+    let streamerName: String?
+    let pageIndicatorReservedWidth: CGFloat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Group {
+                if let originalRoomTitle {
+                    TranslatedRoomTitle(originalRoomTitle)
+                } else {
+                    Text(title)
+                }
+            }
+                .font(.title2.weight(.bold))
+                .foregroundStyle(AppConstants.Colors.primaryText)
+                .multilineTextAlignment(.leading)
+                .lineLimit(2)
+                .minimumScaleFactor(0.82)
+
+            if let streamerName {
+                Text(streamerName)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(AppConstants.Colors.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+        .padding(.trailing, pageIndicatorReservedWidth)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct HomeNavigationOverlay: View {
+    let visibleSectionIDs: Set<String>
+    let model: HomeNavigationModel
+
+    var body: some View {
+        let progress = model.progress
+        let title = model.title(
+            visibleSectionIDs: visibleSectionIDs,
+            activationY: HomeNavigationMetrics.barHeight
+        )
+
+        // No manual top inset: the bar is laid out inside the safe area by its
+        // container. Only its background reaches behind the status bar.
+        Text(title)
+            .font(.headline)
+            .lineLimit(1)
+            .opacity(progress)
+            .contentTransition(.opacity)
+            .animation(.easeInOut(duration: 0.2), value: title)
+            .accessibilityHidden(progress < 0.5)
+            .frame(maxWidth: .infinity)
+            .frame(height: HomeNavigationMetrics.barHeight)
+            // Liquid Glass rather than a solid slab: the feed stays visible through
+            // the bar, and the glass is what keeps the title legible over whatever
+            // scrolls underneath it. Fading the layer with `progress` keeps the
+            // resting state genuinely full-bleed.
+            .background(alignment: .top) {
+                Color.clear
+                    .homeNavigationBarGlass()
+                    .opacity(progress)
+                    .ignoresSafeArea(edges: .top)
+                    .allowsHitTesting(false)
+            }
+    }
+}
+
+private struct HomeHeroRemoteImage: View {
+    let url: URL?
+    let fallbackURL: URL?
+    let targetSize: CGSize
+    let presentationScale: CGFloat
+
+    @Environment(\.displayScale) private var displayScale
+    @State private var imageFailed = false
+
+    /// Kingfisher's downsampler uses the largest requested dimension. Banner
+    /// sources are normally 16:9, while the immersive hero is much taller, so
+    /// size the decode for the vertical crop instead of just the view width.
+    /// The extra presentation scale preserves detail during parallax overscan.
+    private var downsamplingSize: CGSize {
+        let expectedLandscapeAspectRatio: CGFloat = 16 / 9
+        let requiredSourceWidth = targetSize.height
+            * expectedLandscapeAspectRatio
+            * presentationScale
+        let maximumPointDimension = max(
+            targetSize.width * presentationScale,
+            requiredSourceWidth
+        )
+
+        return CGSize(width: maximumPointDimension, height: maximumPointDimension)
+    }
+
+    var body: some View {
+        if let url {
+            KFImage(url)
+                .setProcessor(DownsamplingImageProcessor(size: downsamplingSize))
+                .scaleFactor(displayScale)
+                .cacheOriginalImage()
+                .alternativeSources(fallbackURL.map { [.network($0)] })
+                .onFailure { _ in imageFailed = true }
+                .onSuccess { _ in imageFailed = false }
+                .placeholder { placeholder }
+                .fade(duration: 0.2)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFill()
+                .onChange(of: url) { _, _ in imageFailed = false }
+        } else {
+            placeholder
+        }
+    }
+
+    private var placeholder: some View {
+        HomeHeroImageSkeleton(isLoading: url != nil && !imageFailed)
+    }
+}
+
+private struct HomeHeroImageSkeleton: View {
+    var isLoading = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        Rectangle()
+            .fill(AppConstants.Colors.secondaryBackground)
+            .overlay {
+                LinearGradient(
+                    colors: [
+                        Color.secondary.opacity(0.05),
+                        Color.secondary.opacity(0.14),
+                        Color.secondary.opacity(0.05)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .shimmering(
+                    active: isLoading && !reduceMotion && scenePhase == .active,
+                    duration: 1.8,
+                    delay: 0
+                )
+            }
+            .overlay {
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.55),
+                        .init(color: AppConstants.Colors.primaryBackground.opacity(0.7), location: 0.84),
+                        .init(color: AppConstants.Colors.primaryBackground, location: 1)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+            .clipped()
+            .accessibilityHidden(true)
+    }
+}
+
+private struct HomeHeroPageIndicator: View {
+    let entries: [HomeBannerEntry]
+    let selectedID: String?
+    let progress: CGFloat
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Group {
+            if entries.count > 8 {
+                // Reserve the widest page number so 9 → 10 doesn't reflow the title.
+                Text("\(entries.count) / \(entries.count)")
+                    .hidden()
+                    .overlay(alignment: .trailing) {
+                        Text("\(selectedIndex + 1) / \(entries.count)")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(AppConstants.Colors.secondaryText)
+                    .fixedSize()
+            } else {
+                HStack(spacing: 5) {
+                    ForEach(entries) { entry in
+                        HomeHeroPageProgressCapsule(
+                            isSelected: entry.id == selectedID,
+                            progress: entry.id == selectedID ? progress : 0
+                        )
+                    }
+                }
+            }
+        }
+        .frame(minHeight: 28)
+        .animation(reduceMotion ? nil : .smooth(duration: 0.3), value: selectedID)
+        .accessibilityHidden(true)
+    }
+
+    private var selectedIndex: Int {
+        entries.firstIndex(where: { $0.id == selectedID }) ?? 0
+    }
+}
+
+private struct HomeHeroPageProgressCapsule: View {
+    let isSelected: Bool
+    let progress: CGFloat
+
+    private let capsuleWidth: CGFloat = 18
+    private let capsuleHeight: CGFloat = 5
+
+    private var clampedProgress: CGFloat {
+        min(max(progress, 0), 1)
+    }
+
+    private var fillWidth: CGFloat {
+        guard isSelected else { return 0 }
+        return capsuleHeight
+            + (capsuleWidth - capsuleHeight) * clampedProgress
+    }
+
+    var body: some View {
+        RoundedRectangle(
+            cornerRadius: capsuleHeight / 2,
+            style: .continuous
+        )
+            .fill(AppConstants.Colors.tertiaryText)
+            .overlay(alignment: .leading) {
+                RoundedRectangle(
+                    cornerRadius: capsuleHeight / 2,
+                    style: .continuous
+                )
+                    .fill(AppConstants.Colors.primaryText)
+                    .frame(width: fillWidth, height: capsuleHeight)
+            }
+            .frame(
+                width: isSelected ? capsuleWidth : capsuleHeight,
+                height: capsuleHeight
+            )
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func homeNavigationEdgeEffect(isScrolled: Bool) -> some View {
+        if #available(iOS 26.0, *) {
+            self
+                .scrollEdgeEffectHidden(!isScrolled, for: .top)
+                .toolbarBackground(isScrolled ? .automatic : .hidden, for: .navigationBar)
+        } else {
+            self
+                .toolbarBackground(isScrolled ? .visible : .hidden, for: .navigationBar)
+        }
+    }
+
+    @ViewBuilder
+    func homeNavigationBarGlass() -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular, in: .rect)
+        } else {
+            self.background(.ultraThinMaterial)
+        }
+    }
+
+    @ViewBuilder
+    func homeHeroGlassEffect() -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular, in: .capsule)
+        } else {
+            self
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay {
+                    Capsule()
+                        .stroke(.white.opacity(0.18), lineWidth: 0.5)
+                }
+        }
+    }
+
+}
+
+private struct HomeHeroLoadingCard: View {
+    let containerSize: CGSize
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+
+    private var viewportWidth: CGFloat {
+        containerSize.width
+    }
+
+    private var cardHeight: CGFloat {
+        HomeHeroLayout.cardHeight(for: containerSize)
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            HomeHeroImageSkeleton()
+
+            HStack(alignment: .bottom, spacing: 20) {
+                VStack(alignment: .leading, spacing: 9) {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.secondary.opacity(0.18))
+                        .frame(width: min(viewportWidth * 0.52, 260), height: 22)
+
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(Color.secondary.opacity(0.14))
+                        .frame(width: min(viewportWidth * 0.34, 150), height: 16)
+                }
+                Spacer(minLength: 0)
+                HStack(spacing: 6) {
+                    ForEach(0..<3, id: \.self) { index in
+                        Capsule()
+                            .fill(Color.secondary.opacity(index == 0 ? 0.24 : 0.12))
+                            .frame(width: index == 0 ? 18 : 6, height: 6)
+                    }
+                }
+                .padding(.bottom, 5)
+            }
+            .padding(.horizontal, AppConstants.Spacing.xl)
+            .padding(.bottom, AppConstants.Spacing.xxl)
+            .shimmering(active: !reduceMotion && scenePhase == .active)
+        }
+        .frame(width: viewportWidth, height: cardHeight)
+        .frame(maxWidth: .infinity)
+        .clipped()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("正在恢复首页内容")
+    }
+}
+
+private struct HomeCompactHeader: View {
+
+    var body: some View {
+        HStack {
+            // The picker lives in the persistent home overlay even when there
+            // are no installed home-feed plugins. Preserve its vertical rhythm
+            // without maintaining a second control that can drift out of sync.
+            Color.clear
+                .frame(height: HomeNavigationMetrics.barHeight)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, AppConstants.Spacing.sm)
+        .padding(.horizontal, AppConstants.Spacing.xl)
+        .padding(.bottom, AppConstants.Spacing.md)
+        .background(AppConstants.Colors.primaryBackground)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct HomeRoomSectionsLoading: View {
+    let featuredCardWidth: CGFloat
+    let compactCardWidth: CGFloat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 30) {
+            HomeRoomSectionLoading(cardWidth: featuredCardWidth)
+            HomeRoomSectionLoading(cardWidth: compactCardWidth)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+private struct HomeRoomSectionLoading: View {
+    let cardWidth: CGFloat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AppConstants.Spacing.md) {
+            VStack(alignment: .leading, spacing: 8) {
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.secondary.opacity(0.18))
+                    .frame(width: 96, height: 22)
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.secondary.opacity(0.12))
+                    .frame(width: 132, height: 12)
+            }
+            .padding(.horizontal, AppConstants.Spacing.xl)
+            .shimmering()
+
+            ScrollView(.horizontal) {
+                LazyHStack(alignment: .top, spacing: AppConstants.Spacing.md) {
+                    ForEach(0..<3, id: \.self) { _ in
+                        LiveRoomCardSkeleton(width: cardWidth)
+                    }
+                }
+                .padding(.horizontal, AppConstants.Spacing.xl)
+            }
+            .scrollDisabled(true)
+            .scrollIndicators(.hidden)
+            .clipped()
+        }
+    }
+}
+
+private struct HomeRemoteImage: View {
+    let url: URL?
+    let symbolName: String
+
+    var body: some View {
+        Group {
+            if let url {
+                KFImage(url)
+                    .setProcessor(DownsamplingImageProcessor(size: CGSize(width: 960, height: 540)))
+                    .placeholder { placeholder }
+                    .fade(duration: 0.2)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                placeholder
+            }
+        }
+        .clipped()
+    }
+
+    private var placeholder: some View {
+        Rectangle()
+            .fill(AppConstants.Colors.placeholderGradient())
+            .overlay {
+                Image(systemName: symbolName)
+                    .font(.title2)
+                    .foregroundStyle(AppConstants.Colors.placeholderText)
+            }
+    }
+}
+
+private struct HomeFeedFailureCard: View {
+    let pluginNames: [String]
+    let isRefreshing: Bool
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(spacing: AppConstants.Spacing.md) {
+            Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
+                .foregroundStyle(AppConstants.Colors.warning)
+
+            VStack(alignment: .leading, spacing: AppConstants.Spacing.xs) {
+                Text("部分首页内容暂不可用")
+                    .font(.subheadline.weight(.semibold))
+                Text(pluginNames.joined(separator: "、"))
+                    .font(.caption)
+                    .foregroundStyle(AppConstants.Colors.secondaryText)
+                    .lineLimit(2)
+            }
+
+            Spacer()
+
+            Button("重试", action: retry)
+                .disabled(isRefreshing)
+                .frame(minHeight: 44)
+        }
+        .padding(AppConstants.Spacing.lg)
+        .background(
+            AppConstants.Colors.secondaryBackground,
+            in: RoundedRectangle(cornerRadius: AppConstants.CornerRadius.lg)
+        )
+        .padding(.horizontal, AppConstants.Spacing.xl)
+    }
+}
+
+private struct HomeConfigurationGuide: View {
+    var body: some View {
+        VStack(spacing: AppConstants.Spacing.lg) {
+            Image(systemName: "square.stack.3d.up.badge.plus")
+                .font(.largeTitle)
+                .foregroundStyle(.tint)
+
+            VStack(spacing: AppConstants.Spacing.xs) {
+                Text("配置你的首页")
+                    .font(.headline)
+                Text("添加内容源后，首页会展示它们提供的焦点内容和直播分区。")
+                    .font(.subheadline)
+                    .foregroundStyle(AppConstants.Colors.secondaryText)
+                    .multilineTextAlignment(.center)
+            }
+
+            NavigationLink {
+                AdaptivePlatformView()
+                    .toolbar(.visible, for: .navigationBar)
+            } label: {
+                Text("前往配置")
+                    .font(.headline)
+                    .frame(minWidth: 120, minHeight: 44)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(AppConstants.Spacing.xxl)
+        .background(
+            AppConstants.Colors.secondaryBackground,
+            in: RoundedRectangle(cornerRadius: AppConstants.CornerRadius.xl)
+        )
+        .padding(.horizontal, AppConstants.Spacing.xl)
+    }
+}
+
+private struct HomeCardButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
+            .animation(
+                reduceMotion ? nil : .snappy(duration: 0.18),
+                value: configuration.isPressed
+            )
+    }
+}
+
+typealias HomeCategoryRoute = PluginHomeCategoryRoute
+
+private struct HomeCategoryView: View {
+    let route: HomeCategoryRoute
+    let navigationState: LiveRoomNavigationState
+    let namespace: Namespace.ID
+    @State private var model: PluginHomeCategoryModel
+    @State private var isPullRefreshing = false
+    @Environment(PluginAvailabilityService.self) private var pluginAvailability
+
+    init(
+        route: HomeCategoryRoute,
+        navigationState: LiveRoomNavigationState,
+        namespace: Namespace.ID
+    ) {
+        self.route = route
+        self.navigationState = navigationState
+        self.namespace = namespace
+        model = PluginHomeCategoryModel(route: route)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            roomList(containerWidth: geometry.size.width)
+        }
+        .background(AppConstants.Colors.groupedBackground)
+        .navigationTitle(route.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .fullUITabBarHidden()
+        .task { await model.load(refresh: true) }
+    }
+
+    private func roomList(containerWidth: CGFloat) -> some View {
+        let availableWidth = max(1, containerWidth - AppConstants.Spacing.xl * 2)
+        let columnCount = max(1, Int((availableWidth + AppConstants.Spacing.lg) / (154 + AppConstants.Spacing.lg)))
+        let totalSpacing = AppConstants.Spacing.lg * CGFloat(columnCount - 1)
+        let cardWidth = min(280, (availableWidth - totalSpacing) / CGFloat(columnCount))
+
+        return ScrollView {
+            LazyVGrid(
+                // 列数和卡片共用同一份容器尺寸，避免网格与卡片各自计算列宽后互相溢出。
+                columns: Array(
+                    repeating: GridItem(.fixed(cardWidth), spacing: AppConstants.Spacing.lg, alignment: .top),
+                    count: columnCount
+                ),
+                spacing: AppConstants.Spacing.xl
+            ) {
+                ForEach(model.rooms) { room in
+                    Button {
+                        navigationState.navigate(to: room, categoryRooms: model.rooms)
+                    } label: {
+                        LiveRoomCard(
+                            room: room,
+                            width: cardWidth,
+                            liveCheckMode: .none,
+                            disableTapGesture: true
+                        )
+                        .environment(\.roomTransitionNamespace, namespace)
+                    }
+                    .buttonStyle(HomeCardButtonStyle())
+                    .onAppear {
+                        loadMoreIfNeeded(after: room)
+                    }
+                }
+            }
+            .padding(AppConstants.Spacing.xl)
+            .background {
+                FullUIArcRefreshIndicator(
+                    isEnabled: pluginAvailability.hasAvailablePlugins,
+                    isRefreshing: isPullRefreshing
+                )
+                .frame(width: 0, height: 0)
+            }
+
+            if model.isLoading {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .padding(AppConstants.Spacing.xl)
+            } else if model.rooms.isEmpty {
+                ContentUnavailableView(
+                    "暂无直播间",
+                    systemImage: "rectangle.stack.badge.questionmark",
+                    description: Text(model.errorMessage ?? "当前分类暂时没有可显示的内容。")
+                )
+                .padding(.vertical, 80)
+            }
+        }
+        .refreshable {
+            isPullRefreshing = true
+            defer { isPullRefreshing = false }
+            await model.load(refresh: true)
+        }
+    }
+
+    private func loadMoreIfNeeded(after room: LiveModel) {
+        guard room.id == model.rooms.last?.id else { return }
+        Task { await model.loadMore() }
+    }
+}

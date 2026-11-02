@@ -1,0 +1,335 @@
+//
+//  AngelLiveMacOSApp.swift
+//  AngelLiveMacOS
+//
+//  Created by pc on 10/17/25.
+//  Supported by AI助手Claude
+//
+
+import SwiftUI
+import AngelLiveCore
+import AngelLiveDependencies
+import AppKit
+import Kingfisher
+#if !APPSTORE
+import Sparkle
+#endif
+import Combine
+
+@inline(__always)
+func print(_ items: Any..., separator: String = " ", terminator: String = "\n") {
+#if DEBUG
+    let message = items.map { String(describing: $0) }.joined(separator: separator)
+    Swift.print(message, terminator: terminator)
+#endif
+}
+
+#if !APPSTORE
+// Sparkle 更新控制器
+final class UpdaterViewModel: ObservableObject {
+    private let updaterController: SPUStandardUpdaterController
+
+    @Published var canCheckForUpdates = false
+
+    init() {
+        updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+
+        updaterController.updater.publisher(for: \.canCheckForUpdates)
+            .assign(to: &$canCheckForUpdates)
+    }
+
+    func checkForUpdates() {
+        updaterController.checkForUpdates(nil)
+    }
+}
+#endif
+
+// 应用程序代理
+class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return true
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        if MacUITestBootstrap.context != nil { return }
+        #endif
+        MediaTransformSupport.registerHostCapability()
+        BugsnagBootstrap.start(platform: .macOS)
+        KSOptions.logLevel = .error
+        KSOptions.hudLog = false
+
+        MacDockIconPreference.applyStoredPreference()
+
+        configureImageCache()
+
+        Task {
+            await PlatformSessionLiveParseBridge.syncFromPersistedSessionsOnLaunch()
+            if PlatformCredentialSyncService.shared.iCloudSyncEnabled {
+                await PlatformCredentialSyncService.shared.syncAllFromICloud()
+            }
+        }
+    }
+
+    /// 限制 Kingfisher 磁盘缓存上限,避免直播封面图无限堆积。
+    private func configureImageCache() {
+        let cache = ImageCache.default
+        cache.diskStorage.config.sizeLimit = 200 * 1024 * 1024  // 200 MB
+        cache.diskStorage.config.expiration = .days(3)
+        cache.memoryStorage.config.totalCostLimit = 80 * 1024 * 1024  // 80 MB
+        cache.memoryStorage.config.expiration = .seconds(300)
+        cache.cleanExpiredDiskCache()
+    }
+}
+
+/// The holder is safe to construct in test launches: each production service is created on demand.
+@MainActor
+private final class MacProductionServices {
+    #if !APPSTORE
+    lazy var updater = UpdaterViewModel()
+    #endif
+    lazy var welcome = WelcomeManager()
+    lazy var favorite = AppFavoriteModel()
+    lazy var history = HistoryModel()
+    lazy var toast = ToastManager()
+    lazy var pluginAvailability = PluginAvailabilityService(managesAPICredentialPolicy: true)
+}
+
+#if !APPSTORE
+private struct MacUpdateButton: View {
+    @ObservedObject var updater: UpdaterViewModel
+
+    var body: some View {
+        Button("检查更新...") { updater.checkForUpdates() }
+            .disabled(!updater.canCheckForUpdates)
+    }
+}
+#endif
+
+@main
+struct AngelLiveMacOSApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @Environment(\.openWindow) private var openWindow
+    @FocusedValue(\.macHomeRefreshAction) private var macHomeRefreshAction
+    @State private var production = MacProductionServices()
+
+    private var isUITesting: Bool {
+        #if DEBUG
+        MacUITestBootstrap.context != nil
+        #else
+        false
+        #endif
+    }
+
+    @ViewBuilder
+    private var mainContent: some View {
+        #if DEBUG
+        if let context = MacUITestBootstrap.context {
+            MacHistoryUITestRoot(context: context)
+        } else {
+            productionContent
+        }
+        #else
+        productionContent
+        #endif
+    }
+
+    private var productionContent: some View {
+        ContentView()
+            .environment(production.pluginAvailability)
+            .environment(production.welcome)
+            .environment(production.favorite)
+            .environment(production.history)
+            .environment(production.toast)
+            #if !APPSTORE
+            .environmentObject(production.updater)
+            #endif
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            mainContent
+                .frame(minWidth: 800, maxWidth: .infinity, minHeight: 450, maxHeight: .infinity)
+        }
+        .commands {
+            MacPluginManagementCommands()
+            CommandGroup(replacing: .appInfo) {
+                Button("关于 AngelLive") {
+                    if !SandboxPluginCatalog.installedPluginIds().isEmpty {
+                        openWindow(id: "about")
+                    } else {
+                        NSApp.orderFrontStandardAboutPanel(nil)
+                    }
+                }
+                .disabled(isUITesting)
+            }
+            CommandGroup(after: .appInfo) {
+                #if !APPSTORE
+                if !isUITesting {
+                    MacUpdateButton(updater: production.updater)
+                    Divider()
+                }
+                #endif
+
+                Button("刷新") {
+                    if let macHomeRefreshAction {
+                        macHomeRefreshAction()
+                    } else {
+                        NotificationCenter.default.post(name: NSNotification.Name("RefreshContent"), object: nil)
+                    }
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(isUITesting)
+            }
+            #if DEBUG
+            // Debug 菜单 + ⌘⇧D 召出插件控制台,仅 DEBUG 构建可见。
+            DevConsoleCommands(isEnabled: !isUITesting)
+            #endif
+        }
+        .defaultSize(width: 1024, height: 960)
+        #if DEBUG
+        // UI tests open this native WindowGroup explicitly with File > New Window.
+        // Suppress automatic presentation so each launch owns exactly one window.
+        .defaultLaunchBehavior(isUITesting ? .suppressed : .automatic)
+        .restorationBehavior(isUITesting ? .disabled : .automatic)
+        #endif
+
+        Window("关于 AngelLive", id: "about") {
+            if !isUITesting { MacAboutView() }
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+        .commandsRemoved()
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        #if DEBUG
+        DevConsoleScene(pluginAvailability: { production.pluginAvailability })
+        #endif
+
+        WindowGroup(for: LiveModel.self) { $room in
+            if !isUITesting, let room = room {
+                MacRoomPlaybackDestination(room: room, presentation: .playerWindow)
+                    .environment(production.pluginAvailability)
+                    .environment(production.favorite)
+                    .environment(production.history)
+                    .environment(production.toast)
+                    .roomTitleTranslationHost(enabled: SandboxPluginCatalog.platform(for: room.liveType) != nil)
+                    .supportDiagnosticsHost(enabled: SandboxPluginCatalog.platform(for: room.liveType) != nil)
+                    .background(PlayerWindowChromeView(hidesWindowButtons: true, allowsBackgroundDrag: false))
+            }
+        }
+        // 仅作"首次打开"的提示尺寸 —— 真正强制每次新开都用 16:9 默认值
+        // 由 PlayerWindowChromeNSView.viewDidMoveToWindow 内的 setFrame 完成,
+        // 避免 macOS 状态恢复把上一次拖大/拖小的尺寸"记住"用到下一个房间。
+        .defaultSize(width: 1280, height: 720)
+        // .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unifiedCompact(showsTitle: false))
+        .commands {
+            CommandGroup(replacing: .windowSize) {
+                EmptyView()
+            }
+            CommandGroup(replacing: .windowArrangement) {
+                EmptyView()
+            }
+        }
+    }
+}
+
+private struct PlayerWindowChromeView: NSViewRepresentable {
+    let hidesWindowButtons: Bool
+    let allowsBackgroundDrag: Bool
+
+    func makeNSView(context: Context) -> PlayerWindowChromeNSView {
+        PlayerWindowChromeNSView(
+            hidesWindowButtons: hidesWindowButtons,
+            allowsBackgroundDrag: allowsBackgroundDrag
+        )
+    }
+
+    func updateNSView(_ nsView: PlayerWindowChromeNSView, context: Context) {
+        nsView.hidesWindowButtons = hidesWindowButtons
+        nsView.allowsBackgroundDrag = allowsBackgroundDrag
+        nsView.applyIfPossible()
+    }
+}
+
+private final class PlayerWindowChromeNSView: NSView {
+    var hidesWindowButtons: Bool
+    var allowsBackgroundDrag: Bool
+    private var previousState: WindowChromeState?
+
+    init(hidesWindowButtons: Bool, allowsBackgroundDrag: Bool) {
+        self.hidesWindowButtons = hidesWindowButtons
+        self.allowsBackgroundDrag = allowsBackgroundDrag
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyIfPossible()
+    }
+
+    /// macOS WindowGroup 会持久化用户拖动后的窗口尺寸,导致下一次开新房间还沿用上次大小。
+    /// 这里在首次挂到 window 时把 contentSize 强制重置为 16:9 默认值,在屏幕内居中。
+    /// 用户后续拖动不影响当前窗口 —— 只有"新打开"的窗口才会被重置。
+    private static let defaultContentSize = NSSize(width: 1280, height: 720)
+    private func resetWindowFrameIfNeeded(_ window: NSWindow) {
+        guard let screen = window.screen ?? NSScreen.main else { return }
+        let target = Self.defaultContentSize
+        let contentRect = NSRect(origin: .zero, size: target)
+        let frameRect = window.frameRect(forContentRect: contentRect)
+        let visible = screen.visibleFrame
+        let origin = NSPoint(
+            x: visible.midX - frameRect.width / 2,
+            y: visible.midY - frameRect.height / 2
+        )
+        window.setFrame(NSRect(origin: origin, size: frameRect.size), display: true)
+    }
+
+    func applyIfPossible() {
+        guard let window = window else { return }
+        if previousState == nil {
+            let closeButton = window.standardWindowButton(.closeButton)
+            let miniButton = window.standardWindowButton(.miniaturizeButton)
+            let zoomButton = window.standardWindowButton(.zoomButton)
+            previousState = WindowChromeState(
+                window: window,
+                closeHidden: closeButton?.isHidden ?? false,
+                miniHidden: miniButton?.isHidden ?? false,
+                zoomHidden: zoomButton?.isHidden ?? false,
+                isMovableByWindowBackground: window.isMovableByWindowBackground
+            )
+            // 仅首次挂载时重置 frame,避免每次 SwiftUI 触发 updateNSView 都重置覆盖用户拖动。
+            resetWindowFrameIfNeeded(window)
+        }
+        if let state = previousState {
+            window.standardWindowButton(.closeButton)?.isHidden = hidesWindowButtons ? true : state.closeHidden
+            window.standardWindowButton(.miniaturizeButton)?.isHidden = hidesWindowButtons ? true : state.miniHidden
+            window.standardWindowButton(.zoomButton)?.isHidden = hidesWindowButtons ? true : state.zoomHidden
+        }
+        window.isMovableByWindowBackground = allowsBackgroundDrag
+    }
+
+    // NSView 的释放发生在主线程,isolated deinit 把这一事实告知编译器,
+    // 使 deinit 内可同步恢复 main-actor 隔离的窗口状态。
+    isolated deinit {
+        guard let state = previousState else { return }
+        state.window.standardWindowButton(.closeButton)?.isHidden = state.closeHidden
+        state.window.standardWindowButton(.miniaturizeButton)?.isHidden = state.miniHidden
+        state.window.standardWindowButton(.zoomButton)?.isHidden = state.zoomHidden
+        state.window.isMovableByWindowBackground = state.isMovableByWindowBackground
+    }
+}
+
+private struct WindowChromeState {
+    let window: NSWindow
+    let closeHidden: Bool
+    let miniHidden: Bool
+    let zoomHidden: Bool
+    let isMovableByWindowBackground: Bool
+}

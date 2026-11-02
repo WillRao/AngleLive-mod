@@ -1,0 +1,782 @@
+//
+//  ContentView.swift
+//  AngelLive
+//
+//  Created by pangchong on 10/17/25.
+//
+
+import SwiftUI
+import AngelLiveCore
+import AngelLiveDependencies
+
+// 定义 Tab 选择类型
+enum TabSelection: Hashable {
+    case home
+    case favorites
+    case allPlatforms
+    case platform(String)
+    case settings
+    case search
+}
+
+private enum HomeRecommendationAvailability {
+    case unconfirmed
+    case available
+    case unavailable
+}
+
+struct ContentView: View {
+    @State private var selectedTab: TabSelection = .home
+    @State private var homeRecommendationAvailability = HomeRecommendationAvailability.unconfirmed
+    @AppStorage(HomePagePreference.storageKey, store: .shared)
+    private var homePagePreference = HomePagePreference.recommendations
+    @AppStorage(HomePagePreference.selectedPluginStorageKey, store: .shared)
+    private var selectedHomePluginId = ""
+    @Environment(\.presentToast) private var presentToast
+    @Environment(\.scenePhase) private var scenePhase
+
+    // 首次启动管理器
+    @Environment(WelcomeManager.self) private var welcomeManager
+
+    // 插件检测服务
+    @Environment(PluginAvailabilityService.self) private var pluginAvailability
+
+    // 壳 UI 服务
+    @State private var bookmarkService = StreamBookmarkService()
+    @State private var pluginSourceManager = PluginSourceManager()
+    @State private var shellHistoryService = ShellHistoryService()
+
+    // CloudKit 插件源同步
+    @State private var pluginSourceSyncService = PluginSourceSyncService()
+    @State private var showPluginSyncPrompt = false
+    @State private var pluginInstallation = PluginInstallationCoordinator()
+    @State private var pendingPluginInstallationEntry: PluginInstallationEntry?
+
+    // 插件订阅 / 安装确认请求器
+    @State private var consentService = PluginInstallConsentService()
+
+    // 创建全局 ViewModels
+    @State private var platformViewModel = PlatformViewModel()
+    @Environment(AppFavoriteModel.self) private var favoriteViewModel
+    @State private var searchViewModel = SearchViewModel()
+
+    // 触觉反馈生成器
+    private let hapticFeedback = UISelectionFeedbackGenerator()
+
+    /// iPad 的首页仅存在于 FullUI；模式切换时始终给 TabView 一个有效选择。
+    private var tabSelection: Binding<TabSelection> {
+        Binding(
+            get: {
+                if !pluginAvailability.hasAvailablePlugins {
+                    switch selectedTab {
+                    case .home, .search, .platform:
+                        return AppConstants.Device.isIPad ? .favorites : .home
+                    default:
+                        break
+                    }
+                }
+                if case .platform(let pluginId) = selectedTab,
+                   !platformViewModel.platformInfo.contains(where: { $0.pluginId == pluginId }) {
+                    return .home
+                }
+                return selectedTab
+            },
+            set: { selectedTab = $0 }
+        )
+    }
+
+    // 动态获取 TabSection 标题
+    private var platformSectionTitle: String {
+        if case .platform(let pluginId) = selectedTab,
+           let platform = platformViewModel.platformInfo.first(where: { $0.pluginId == pluginId }) {
+            return platform.title
+        }
+        return "配置"
+    }
+
+    /// FullUI 首页切到收藏时，tab 图标跟随收藏同步状态。
+    private var favoriteTabSyncStatus: CloudSyncStatus {
+        favoriteViewModel.syncStatus
+    }
+
+    private var homePlatformOptions: [HomePlatformOption] {
+        platformViewModel.platformInfo.compactMap { platform in
+            guard PlatformCapability.supports(.homeFeed, for: platform.liveType) else {
+                return nil
+            }
+            return HomePlatformOption(
+                pluginId: platform.pluginId,
+                displayName: platform.title,
+                liveType: platform.liveType
+            )
+        }
+    }
+
+    /// FullUI 中只有确认所有插件都不支持 homeFeed 时才回退到收藏。
+    /// 不覆盖持久化偏好，以便以后安装支持推荐页的插件后恢复用户原选择。
+    private var effectiveHomePagePreference: HomePagePreference {
+        guard pluginAvailability.hasAvailablePlugins else {
+            return .favorites
+        }
+
+        switch homeRecommendationAvailability {
+        case .unconfirmed, .available:
+            return homePagePreference
+        case .unavailable:
+            return .favorites
+        }
+    }
+
+    @ViewBuilder
+    private var iPhoneHomeTabIcon: some View {
+        if effectiveHomePagePreference == .favorites {
+            // UIKit 动画器会接管这个占位符，避免 SwiftUI 重建 tab 图标时打断效果。
+            Image(systemName: "checkmark.icloud.fill")
+        } else {
+            Image(systemName: "house.fill")
+        }
+    }
+
+    private var iPhoneHomeTabTitle: String {
+        effectiveHomePagePreference == .favorites ? "收藏" : "首页"
+    }
+
+    private var recommendationsAvailableForMenu: Bool {
+        homeRecommendationAvailability != .unavailable
+    }
+
+    @ViewBuilder
+    private var preferredHomePage: some View {
+        if !pluginAvailability.hasAvailablePlugins {
+            AdaptiveFavoriteView()
+        } else {
+            switch effectiveHomePagePreference {
+            case .recommendations:
+                HomeView()
+                    .apiCredentialContentIdentity()
+            case .favorites:
+                AdaptiveFavoriteView()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var iPhoneTabBarAccessories: some View {
+        if pluginAvailability.hasAvailablePlugins {
+            HomeTabContextMenuInstaller(
+                options: homePlatformOptions,
+                recommendationsAvailable: recommendationsAvailableForMenu,
+                selectedPreference: effectiveHomePagePreference,
+                selectedPluginId: selectedHomePluginId,
+                allowsTipPresentation: selectedTab == .home && !welcomeManager.showWelcome && scenePhase == .active,
+                onSelectRecommendations: selectRecommendations,
+                onSelectFavorites: selectFavorites,
+                onSelectPlatform: selectPlatform
+            )
+        }
+
+        if pluginAvailability.hasAvailablePlugins
+            && effectiveHomePagePreference == .favorites {
+            FavoriteTabSymbolAnimator(syncStatus: favoriteTabSyncStatus)
+        }
+    }
+
+    var body: some View {
+        @Bindable var manager = welcomeManager
+        @Bindable var installation = pluginInstallation
+
+        Group {
+            if #available(iOS 18.0, *) {
+                if AppConstants.Device.isIPad {
+                    iPadTabView
+                } else {
+                    iPhoneTabView
+                        .background {
+                            iPhoneTabBarAccessories
+                        }
+                }
+            } else {
+                if AppConstants.Device.isIPad {
+                    iOS17iPadTabView
+                } else {
+                    iOS17iPhoneTabView
+                        .background {
+                            iPhoneTabBarAccessories
+                        }
+                }
+            }
+        }
+        .fullUIWindowContext(isEnabled: pluginAvailability.hasAvailablePlugins)
+        .environment(pluginAvailability)
+        .platformAPICredentialLifecycle(enabled: pluginAvailability.hasAvailablePlugins)
+        .roomTitleTranslationHost(enabled: pluginAvailability.hasAvailablePlugins)
+        .supportDiagnosticsHost(enabled: pluginAvailability.hasAvailablePlugins)
+        .environment(bookmarkService)
+        .environment(pluginSourceManager)
+        .environment(pluginInstallation)
+        .environment(consentService)
+        .environment(shellHistoryService)
+        .environment(platformViewModel)
+        .environment(favoriteViewModel)
+        .environment(searchViewModel)
+        .onChange(of: selectedTab) { _, newValue in
+            hapticFeedback.selectionChanged()
+            guard pluginAvailability.hasAvailablePlugins else { return }
+            switch newValue {
+            case .home:
+                SupportDiagnosticsService.shared.recordAction(.openedHome)
+            case .favorites:
+                SupportDiagnosticsService.shared.recordAction(.openedFavorites)
+            case .allPlatforms:
+                SupportDiagnosticsService.shared.recordAction(.openedPlatform)
+            case .platform(let pluginID):
+                let context = LiveParseJSPlatformManager.platform(forPluginId: pluginID).map {
+                    SupportDiagnosticActionContext.platform($0, additional: ["entryPoint": "tab"])
+                } ?? ["pluginID": pluginID, "entryPoint": "tab"]
+                SupportDiagnosticsService.shared.recordAction(.openedPlatform, context: context)
+            case .settings:
+                SupportDiagnosticsService.shared.recordAction(.openedSettings)
+            case .search:
+                SupportDiagnosticsService.shared.recordAction(.openedSearch)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .switchToSettings)) { _ in
+            selectedTab = .settings
+        }
+        .sheet(isPresented: $manager.showWelcome, onDismiss: presentCloudPluginPromptIfNeeded) {
+            WelcomeView(usesResizableLayout: pluginAvailability.hasAvailablePlugins) {
+                welcomeManager.completeWelcome()
+                // 中国区 iOS 首次启动需要用户授权网络权限，
+                // 此时 .task 中的 fetchKeys 可能已因无权限失败，
+                // 用户点击欢迎页确认后重新拉取一次。
+                Task { await PluginSourceKeyService.shared.fetchKeys() }
+            }
+            .modifier(WelcomePresentationModifier())
+        }
+        .task {
+            // 注入插件安装确认请求器
+            pluginSourceManager.consentRequester = consentService
+
+            // 启动时拉取 key 映射（后台静默，不阻塞 UI）
+            Task { await PluginSourceKeyService.shared.fetchKeys() }
+            await pluginAvailability.checkAvailability()
+            platformViewModel.refreshPlatforms(installedPluginIds: pluginAvailability.installedPluginIds)
+            updateHomeRecommendationAvailability()
+
+            // 自动检查插件更新（非阻塞，在 UI 就绪后后台运行）
+            if pluginAvailability.hasAvailablePlugins && !pluginSourceManager.sourceURLs.isEmpty {
+                await pluginSourceManager.refreshAvailableUpdates()
+                let updatableIds = pluginAvailability.installedPluginIds.filter {
+                    pluginSourceManager.hasUpdate(for: $0)
+                }
+                if !updatableIds.isEmpty {
+                    presentToast(ToastValue(
+                        icon: Image(systemName: "arrow.triangle.2.circlepath"),
+                        message: "有 \(updatableIds.count) 个插件需要更新，正在更新..."
+                    ))
+                    var successCount = 0
+                    for id in updatableIds {
+                        if await pluginSourceManager.updatePlugin(pluginId: id) {
+                            successCount += 1
+                        }
+                    }
+                    await pluginAvailability.refresh()
+                    updateHomeRecommendationAvailability()
+                    if successCount > 0 {
+                        presentToast(ToastValue(
+                            icon: Image(systemName: "checkmark.circle.fill"),
+                            message: "\(successCount) 个插件已更新完成"
+                        ))
+                    }
+                }
+            }
+
+            // 无本地插件时，检查 CloudKit 是否有已保存的插件源
+            if !pluginAvailability.hasAvailablePlugins {
+                await pluginSourceSyncService.checkCloudForSources()
+                presentCloudPluginPromptIfNeeded()
+            }
+        }
+        .alert("发现 iCloud 订阅源", isPresented: $showPluginSyncPrompt) {
+            Button("查看插件") {
+                openPluginInstallation(.cloudSources(pluginSourceSyncService.syncedSourceURLs))
+                pluginSourceSyncService.dismissPrompt()
+            }
+            Button("取消", role: .cancel) {
+                pluginSourceSyncService.dismissPrompt()
+            }
+        } message: {
+            Text("iCloud 中保存了订阅源。查看其中的插件，选择需要安装的项目。")
+        }
+        .sheet(item: $installation.presentation) { presentation in
+            NavigationStack {
+                PluginManagementView(entry: presentation.entry, isPresentedModally: true)
+            }
+            .id(presentation.id)
+            .environment(pluginAvailability)
+            .environment(pluginSourceManager)
+            .environment(pluginInstallation)
+            .environment(consentService)
+        }
+        .onOpenURL { url in
+            guard let link = AngelLiveDeepLink.parse(url) else { return }
+            handleDeepLink(link)
+        }
+        // 插件状态变化时刷新平台列表
+        .onChange(of: pluginAvailability.installedPluginIds) { oldIds, newIds in
+            platformViewModel.refreshPlatforms(installedPluginIds: newIds)
+            updateHomeRecommendationAvailability()
+            // 从无插件变为有插件时，主动触发收藏同步
+            if oldIds.isEmpty && !newIds.isEmpty {
+                Task {
+                    await favoriteViewModel.syncWithActor()
+                }
+            }
+            if newIds.isEmpty, selectedTab == .search {
+                selectedTab = .home
+            }
+        }
+        // 原地升级不会改变 pluginId 列表。以目录修订号重建平台元数据和
+        // homeFeed 能力，避免长按 Tab 菜单继续使用更新前的能力快照。
+        .onChange(of: pluginAvailability.catalogRevision) { _, _ in
+            let catalogChanged = favoriteViewModel.updateFavoriteRefreshCatalog(SandboxPluginCatalog.installedPluginMap())
+            if catalogChanged, pluginAvailability.hasAvailablePlugins {
+                Task { await favoriteViewModel.syncWithActor() }
+            }
+            platformViewModel.refreshPlatforms(
+                installedPluginIds: pluginAvailability.installedPluginIds
+            )
+            updateHomeRecommendationAvailability()
+        }
+        .onChange(of: pluginAvailability.isChecking) { _, isChecking in
+            if !isChecking {
+                updateHomeRecommendationAvailability()
+            }
+        }
+        .fullUINavigationStyle(enabled: pluginAvailability.hasAvailablePlugins)
+        .onChange(of: platformViewModel.platformInfo) { _, newPlatforms in
+            // Tab 选择只保存稳定的 pluginId；标题或图标更新不应改变身份。
+            // 仅在插件被移除后回退，避免 selection 指向已不存在的 Tab。
+            if case .platform(let pluginId) = selectedTab,
+               !newPlatforms.contains(where: { $0.pluginId == pluginId }) {
+                selectedTab = .home
+            }
+
+            if !selectedHomePluginId.isEmpty,
+               !newPlatforms.contains(where: {
+                   $0.pluginId == selectedHomePluginId
+                       && PlatformCapability.supports(.homeFeed, for: $0.liveType)
+               }) {
+                selectedHomePluginId = ""
+            }
+        }
+    }
+
+    // MARK: - Deep Link Handling
+
+    @MainActor
+    private func handleDeepLink(_ link: AngelLiveDeepLink) {
+        switch link {
+        case .installSource(let input):
+            openPluginInstallation(.sourceInput(input))
+        }
+    }
+
+    @MainActor
+    private func openPluginInstallation(_ entry: PluginInstallationEntry) {
+        guard !welcomeManager.showWelcome else {
+            pendingPluginInstallationEntry = entry
+            return
+        }
+        guard !pluginInstallation.isPreparing, !pluginInstallation.isInstalling,
+              !pluginSourceManager.isManagementBusy else {
+            presentToast(ToastValue(
+                icon: Image(systemName: "info.circle"),
+                message: "正在处理插件，请完成后再打开安装入口"
+            ))
+            return
+        }
+        pluginInstallation.presentation = PluginInstallationPresentation(entry: entry)
+    }
+
+    @MainActor
+    private func updateHomeRecommendationAvailability() {
+        guard pluginAvailability.hasAvailablePlugins else {
+            homeRecommendationAvailability = .unavailable
+            if AppConstants.Device.isIPad, selectedTab == .home {
+                selectedTab = .favorites
+            }
+            return
+        }
+        guard pluginAvailability.hasCheckedAvailability else {
+            homeRecommendationAvailability = .unconfirmed
+            return
+        }
+
+        let supportsRecommendations = SandboxPluginCatalog
+            .availablePlatforms(installedPluginIds: pluginAvailability.installedPluginIds)
+            .contains { platform in
+                PlatformCapability.supports(.homeFeed, for: platform.liveType)
+            }
+
+        if supportsRecommendations {
+            homeRecommendationAvailability = .available
+        } else {
+            // iPad 的首页和收藏是两个独立栏目。没有推荐能力时仍保留首页栏目，
+            // 但默认落到收藏，遵守“无推荐页时展示收藏”的产品规则。
+            if AppConstants.Device.isIPad, selectedTab == .home {
+                selectedTab = .favorites
+            }
+            homeRecommendationAvailability = .unavailable
+        }
+    }
+
+    @MainActor
+    private func selectRecommendations() {
+        guard recommendationsAvailableForMenu else { return }
+        selectedHomePluginId = ""
+        homePagePreference = .recommendations
+        selectedTab = .home
+    }
+
+    @MainActor
+    private func selectFavorites() {
+        homePagePreference = .favorites
+        selectedTab = AppConstants.Device.isIPad ? .favorites : .home
+    }
+
+    @MainActor
+    private func selectPlatform(_ option: HomePlatformOption) {
+        selectedHomePluginId = option.pluginId
+        homePagePreference = .recommendations
+        selectedTab = .home
+    }
+
+    // MARK: - 云端订阅源入口
+
+    private func presentCloudPluginPromptIfNeeded() {
+        if !welcomeManager.showWelcome, let entry = pendingPluginInstallationEntry {
+            pendingPluginInstallationEntry = nil
+            openPluginInstallation(entry)
+            return
+        }
+        guard !welcomeManager.showWelcome,
+              !pluginAvailability.hasAvailablePlugins,
+              pluginSourceSyncService.hasSyncedSources,
+              pluginInstallation.presentation == nil else { return }
+        showPluginSyncPrompt = true
+    }
+
+    // MARK: - iPad TabView (iOS 18+)
+
+    @available(iOS 18.0, *)
+    private var iPadTabView: some View {
+        TabView(selection: tabSelection) {
+            if pluginAvailability.hasAvailablePlugins {
+                Tab("首页", systemImage: "house.fill", value: TabSelection.home) {
+                    HomeView(usesPersistedPlatformSelection: false)
+                        .apiCredentialContentIdentity()
+                        .fullUITabBarSelection(tab: .home, selection: tabSelection)
+                }
+            }
+
+            Tab(value: TabSelection.favorites) {
+                AdaptiveFavoriteView()
+                    .fullUITabBarSelection(tab: .favorites, selection: tabSelection)
+            } label: {
+                Label {
+                    Text("收藏")
+                } icon: {
+                    CloudSyncTabIcon(syncStatus: favoriteTabSyncStatus)
+                }
+            }
+
+            TabSection(platformSectionTitle) {
+                Tab(value: TabSelection.allPlatforms) {
+                    AdaptivePlatformView()
+                        .fullUITabBarSelection(tab: .allPlatforms, selection: tabSelection)
+                } label: {
+                    Label {
+                        Text("全部配置")
+                    } icon: {
+                        Image(systemName: "square.grid.2x2.fill")
+                            .resizable()
+                            .frame(width: 25, height: 25)
+                    }
+                }
+
+                ForEach(platformViewModel.platformInfo, id: \.pluginId) { platform in
+                    Tab(value: TabSelection.platform(platform.pluginId)) {
+                        PlatformDetailTabContainer(platform: platform)
+                            .apiCredentialContentIdentity(pluginId: platform.pluginId)
+                            .fullUITabBarSelection(
+                                tab: .platform(platform.pluginId),
+                                selection: tabSelection
+                            )
+                    } label: {
+                        Label {
+                            Text(platform.title)
+                        } icon: {
+                            if let image = PlatformIconProvider.tabImage(for: platform.liveType) {
+                                Image(uiImage: image)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 25, height: 25)
+                            } else {
+                                Image(systemName: "play.tv")
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 25, height: 25)
+                            }
+
+                        }
+                    }
+                }
+            }
+
+            if pluginAvailability.hasAvailablePlugins {
+                // iOS 26+ 支持 search role，iOS 18 需要普通 Tab
+                if #available(iOS 26.0, *) {
+                    Tab("搜索", systemImage: "magnifyingglass", value: TabSelection.search, role: .search) {
+                        AdaptiveSearchView()
+                            .fullUITabBarSelection(tab: .search, selection: tabSelection)
+                    }
+                } else {
+                    Tab(value: TabSelection.search) {
+                        AdaptiveSearchView()
+                            .fullUITabBarSelection(tab: .search, selection: tabSelection)
+                    } label: {
+                        Label("搜索", systemImage: "magnifyingglass")
+                    }
+                }
+            }
+
+            Tab("设置", systemImage: "gearshape.fill", value: TabSelection.settings) {
+                SettingView()
+                    .fullUITabBarSelection(tab: .settings, selection: tabSelection)
+            }
+        }
+        .tabViewStyle(.sidebarAdaptable)
+    }
+
+    // MARK: - iPhone TabView (iOS 18+)
+
+    @available(iOS 26.0, *)
+    private var iPhoneSearchTabRole: TabRole {
+        if #available(iOS 27.0, *) {
+            // Keep the FullUI search destination separate from the main tab group.
+            return .prominent
+        }
+        return .search
+    }
+
+    @available(iOS 18.0, *)
+    private var iPhoneTabView: some View {
+        if #available(iOS 26.0, *) {
+            return TabView(selection: tabSelection) {
+                if pluginAvailability.hasAvailablePlugins {
+                    Tab(value: TabSelection.home) {
+                        preferredHomePage
+                            .fullUITabBarSelection(tab: .home, selection: tabSelection)
+                    } label: {
+                        Label {
+                            Text(iPhoneHomeTabTitle)
+                        } icon: {
+                            iPhoneHomeTabIcon
+                        }
+                    }
+                } else {
+                    Tab("收藏", systemImage: "bookmark.fill", value: TabSelection.home) {
+                        preferredHomePage
+                            .fullUITabBarSelection(tab: .home, selection: tabSelection)
+                    }
+                }
+
+                Tab("配置", systemImage: "square.grid.2x2.fill", value: TabSelection.allPlatforms) {
+                    AdaptivePlatformView()
+                        .fullUITabBarSelection(tab: .allPlatforms, selection: tabSelection)
+                }
+
+                if pluginAvailability.hasAvailablePlugins {
+                    Tab("搜索", systemImage: "magnifyingglass", value: TabSelection.search, role: iPhoneSearchTabRole) {
+                        AdaptiveSearchView()
+                            .fullUITabBarSelection(tab: .search, selection: tabSelection)
+                    }
+                }
+
+                Tab("设置", systemImage: "gearshape.fill", value: TabSelection.settings) {
+                    SettingView()
+                        .fullUITabBarSelection(tab: .settings, selection: tabSelection)
+                }
+            }
+            .tabViewStyle(.sidebarAdaptable)
+            .tabBarMinimizeBehavior(.onScrollDown)
+        } else {
+           return TabView(selection: tabSelection) {
+                if pluginAvailability.hasAvailablePlugins {
+                    Tab(value: TabSelection.home) {
+                        preferredHomePage
+                            .fullUITabBarSelection(tab: .home, selection: tabSelection)
+                    } label: {
+                        Label {
+                            Text(iPhoneHomeTabTitle)
+                        } icon: {
+                            iPhoneHomeTabIcon
+                        }
+                    }
+                } else {
+                    Tab("收藏", systemImage: "bookmark.fill", value: TabSelection.home) {
+                        preferredHomePage
+                            .fullUITabBarSelection(tab: .home, selection: tabSelection)
+                    }
+                }
+
+                Tab("配置", systemImage: "square.grid.2x2.fill", value: TabSelection.allPlatforms) {
+                    AdaptivePlatformView()
+                        .fullUITabBarSelection(tab: .allPlatforms, selection: tabSelection)
+                }
+
+                if pluginAvailability.hasAvailablePlugins {
+                    // iOS 18 不支持 search role
+                    Tab(value: TabSelection.search) {
+                        AdaptiveSearchView()
+                            .fullUITabBarSelection(tab: .search, selection: tabSelection)
+                    } label: {
+                        Label("搜索", systemImage: "magnifyingglass")
+                    }
+                }
+
+                Tab("设置", systemImage: "gearshape.fill", value: TabSelection.settings) {
+                    SettingView()
+                        .fullUITabBarSelection(tab: .settings, selection: tabSelection)
+                }
+            }
+        }
+    }
+
+    // MARK: - iOS 17 兼容版本
+
+    // iPad iOS 17 TabView
+    private var iOS17iPadTabView: some View {
+        TabView(selection: tabSelection) {
+            if pluginAvailability.hasAvailablePlugins {
+                HomeView(usesPersistedPlatformSelection: false)
+                    .apiCredentialContentIdentity()
+                    .tabItem {
+                        Label("首页", systemImage: "house.fill")
+                    }
+                    .tag(TabSelection.home)
+            }
+
+            AdaptiveFavoriteView()
+                .tabItem {
+                    Label {
+                        Text("收藏")
+                    } icon: {
+                        CloudSyncTabIcon(syncStatus: favoriteTabSyncStatus)
+                    }
+                }
+                .tag(TabSelection.favorites)
+
+            AdaptivePlatformView()
+                .tabItem {
+                    Label("配置", systemImage: "square.grid.2x2.fill")
+                }
+                .tag(TabSelection.allPlatforms)
+
+            if pluginAvailability.hasAvailablePlugins {
+                AdaptiveSearchView()
+                    .tabItem {
+                        Label("搜索", systemImage: "magnifyingglass")
+                    }
+                    .tag(TabSelection.search)
+            }
+
+            SettingView()
+                .tabItem {
+                    Label("设置", systemImage: "gearshape.fill")
+                }
+                .tag(TabSelection.settings)
+        }
+    }
+
+    // iPhone iOS 17 TabView
+    private var iOS17iPhoneTabView: some View {
+        TabView(selection: tabSelection) {
+            if pluginAvailability.hasAvailablePlugins {
+                preferredHomePage
+                    .tabItem {
+                        Label {
+                            Text(iPhoneHomeTabTitle)
+                        } icon: {
+                            iPhoneHomeTabIcon
+                        }
+                    }
+                    .tag(TabSelection.home)
+            } else {
+                preferredHomePage
+                    .tabItem {
+                        Label("收藏", systemImage: "bookmark.fill")
+                    }
+                    .tag(TabSelection.home)
+            }
+
+            AdaptivePlatformView()
+                .tabItem {
+                    Label("配置", systemImage: "square.grid.2x2.fill")
+                }
+                .tag(TabSelection.allPlatforms)
+
+            if pluginAvailability.hasAvailablePlugins {
+                AdaptiveSearchView()
+                    .tabItem {
+                        Label("搜索", systemImage: "magnifyingglass")
+                    }
+                    .tag(TabSelection.search)
+            }
+
+            SettingView()
+                .tabItem {
+                    Label("设置", systemImage: "gearshape.fill")
+                }
+                .tag(TabSelection.settings)
+        }
+    }
+
+}
+
+private struct PlatformDetailTabContainer: View {
+    let platform: Platformdescription
+    @State private var showCapabilitySheet = false
+
+    var body: some View {
+        NavigationStack {
+            PlatformDetailViewControllerWrapper()
+                .environment(PlatformDetailViewModel(platform: platform))
+                .navigationBarTitleDisplayMode(.inline)
+                .navigationTitle(platform.title)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            showCapabilitySheet = true
+                        } label: {
+                            Image(systemName: "info.circle")
+                        }
+                    }
+                }
+                .fullUITabBarVisibilityRoot()
+        }
+        .sheet(isPresented: $showCapabilitySheet) {
+            PlatformCapabilitySheet(liveType: platform.liveType)
+        }
+    }
+}
+
+#Preview {
+    ContentView()
+        .environment(PluginAvailabilityService())
+        .environment(AppFavoriteModel())
+        .environment(HistoryModel())
+        .environment(WelcomeManager())
+        .environment(PlayerCoordinatorManager())
+}

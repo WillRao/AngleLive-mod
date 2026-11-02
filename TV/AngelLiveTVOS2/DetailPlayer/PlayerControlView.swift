@@ -1,0 +1,1324 @@
+//
+//  PlayerControlView.swift
+//  SimpleLiveTVOS
+//
+//  Created by pc on 2023/12/27.
+//
+
+import SwiftUI
+import TipKit
+import AVFoundation
+import AngelLiveCore
+import AngelLiveDependencies
+#if DEBUG
+import os
+#endif
+
+enum PlayControlFocusableField: Hashable {
+    case playPause
+    case refresh
+    case favorite
+    case playQuality
+    case danmu
+    case listContent(Int)
+    case list
+    case left
+    case right
+    case danmuSetting
+}
+
+enum PlayControlTopField: Hashable {
+    case section(Int)
+    case list(Int)
+}
+
+
+struct PlayerControlView: View {
+
+    @Environment(RoomInfoViewModel.self) var roomInfoViewModel
+    @Environment(AppState.self) var appViewModel
+
+    @State var sectionList: [LiveModel] = []
+    @State var selectIndex = 0
+    @State private var showStatisticsPanel = false
+    @State private var showQualityPanel = false
+    @State private var showSubtitleLanguages = false
+    @State private var subtitleActivationID = UUID()
+    @State private var subtitleFocusGeneration = UUID()
+    @State private var suppressHiddenFocusActivation = false
+    @State private var pendingVisibleFocusAfterReveal: PlayControlFocusableField?
+    @State private var showVolumeHUD = false
+    @State private var volumeHUDHideTask: Task<Void, Never>?
+    @StateObject private var systemVolumeObserver = TVSystemVolumeObserver()
+
+    @FocusState var state: PlayControlFocusableField?
+    @FocusState var topState: PlayControlTopField?
+    @FocusState var showDanmuSetting: Bool
+
+    @ObservedObject var playerCoordinator: KSVideoPlayer.Coordinator
+
+    private let multiCameraTip = MultiCameraTip()
+    #if DEBUG
+    private static let navigationLog = OSLog(
+        subsystem: Bundle.main.bundleIdentifier ?? "AngelLiveTVOS",
+        category: "PlayerNavigation"
+    )
+    #endif
+
+    /// 是否有多机位（cdn数量大于1）
+    private var hasMultiCamera: Bool {
+        (roomInfoViewModel.currentRoomPlayArgs?.count ?? 0) > 1
+    }
+
+    private var usesFullUIControlSpacing: Bool {
+        appViewModel.pluginAvailability.hasAvailablePlugins
+    }
+
+    private var titleTranslationEnabled: Bool {
+        appViewModel.pluginAvailability.hasAvailablePlugins
+            && SandboxPluginCatalog.platform(for: roomInfoViewModel.currentRoom.liveType) != nil
+    }
+    
+    private func topTabLabel(_ title: String) -> some View {
+        Text(title)
+            .font(.title3.bold())
+            .foregroundStyle(.white)
+            .padding(.horizontal, usesFullUIControlSpacing ? 0 : 22)
+            .padding(.vertical, usesFullUIControlSpacing ? 0 : 8)
+            .contentShape(Capsule())
+    }
+
+
+    var body: some View {
+        
+        @Bindable var roomInfoModel = roomInfoViewModel
+        
+        ZStack {
+            if roomInfoViewModel.showControl && !roomInfoViewModel.showTop {
+                // 遮罩独立贴住画面底边；按钮仍遵循原有安全区和焦点布局。
+                VStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    LinearGradient(
+                        colors: [.clear, .black.opacity(0.1), .black.opacity(0.5), .black],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 150)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea(.container, edges: [.horizontal, .bottom])
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
+
+            if roomInfoViewModel.showTop {
+                VStack {
+                    VStack(spacing: usesFullUIControlSpacing ? 32 : 105) {
+                        // FullUI uses the same capsule clearance as the bottom controls.
+                        HStack {
+                            Spacer()
+                            HStack(spacing: usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.spacing : 12) {
+                                if showsFavoriteTopTab {
+                                    Button(action: {}) {
+                                        topTabLabel("收藏")
+                                    }
+                                    .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                                 isFocused: topState == .section(0), shape: .capsule))
+                                    .focused($topState, equals: .section(0))
+                                }
+                                Button(action: {}) {
+                                    topTabLabel("历史")
+                                }
+                                .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                             isFocused: topState == .section(1), shape: .capsule))
+                                .focused($topState, equals: .section(1))
+                                if roomInfoModel.roomType == .live {
+                                    Button(action: {}) {
+                                        topTabLabel("分区")
+                                    }
+                                    .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                                 isFocused: topState == .section(2), shape: .capsule))
+                                    .focused($topState, equals: .section(2))
+                                }
+                            }
+                            .modifier(TVFullUIPlayerControlGroupModifier(enabled: usesFullUIControlSpacing,
+                                                                        legacyInsets: EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)))
+                            Spacer()
+                        }
+                        .foregroundColor(.white)
+                        .frame(height: usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.height + 2 * TVFullUIPlayerControlMetrics.inset : 55)
+                        .focusSection()
+                        .onChange(of: topState) { oldValue, newValue in
+                            switch newValue {
+                                case .section(let index):
+                                    changeList(index)
+                                default:
+                                    break
+                            }
+                        }
+                        
+                        // FullUI keeps the card row at its intrinsic height so its
+                        // title and focus growth are not compressed by the old shelf.
+                        ScrollView(.horizontal) {
+                            if usesFullUIControlSpacing {
+                                LazyHStack(alignment: .top) {
+                                    relatedRoomCards
+                                }
+                                .padding()
+                            } else {
+                                LazyHGrid(rows: [GridItem(.flexible())]) {
+                                    relatedRoomCards
+                                }
+                                .padding()
+                            }
+                        }
+                        .padding([.leading, .trailing], 55)
+                        .padding(.top, usesFullUIControlSpacing ? 0 : 65)
+                        .fixedSize(horizontal: false, vertical: usesFullUIControlSpacing)
+                        .scrollClipDisabled()
+                        .focusSection()
+                        
+                        if !usesFullUIControlSpacing {
+                            Spacer()
+                        }
+                    }
+                    .padding(.top, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.screenInset : 0)
+                    .padding(.bottom, usesFullUIControlSpacing ? 32 : 0)
+                    .background(.black.opacity(0.6))
+                    .frame(width: usesFullUIControlSpacing ? nil : 1920,
+                           height: usesFullUIControlSpacing ? nil : 390)
+                    .padding(.top, usesFullUIControlSpacing ? 0 : 30)
+                    .transition(.move(edge: .top))
+                    
+                    Spacer()
+                }
+            }else {
+                VStack {
+                    HStack {
+                        Spacer()
+                        VStack {
+                            Spacer()
+                                .frame(height: 15)
+                            Text("下滑切换直播间")
+                                .foregroundStyle(.white)
+                            Image(systemName: "chevron.compact.down")
+                                .foregroundStyle(.white)
+                        }
+                        .shimmering(active: true)
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .opacity(roomInfoViewModel.showTips ? 1 : 0)
+//可以放个播放按钮
+                if roomInfoModel.showDanmuSettingView == true {
+                    GeometryReader { geometry in
+                        HStack {
+                            Spacer()
+                            DanmuSettingMainView(showDanmuView: _showDanmuSetting)
+                                .environment(appViewModel)
+                                .frame(width: geometry.size.width / 2 - 100, height: geometry.size.height)
+                                .padding([.leading, .trailing], 50)
+                                .background(.thinMaterial)
+                                .focused($state, equals: .danmuSetting)
+                        }
+                    }
+                }
+
+                if showStatisticsPanel {
+                    GeometryReader { geometry in
+                        HStack {
+                            Spacer()
+                            TVPlayerStatisticsPanel(
+                                playerCoordinator: playerCoordinator,
+                                qualityTitle: roomInfoViewModel.currentPlayQualityString,
+                                streamURL: roomInfoViewModel.currentPlayURL
+                            ) {
+                                hideStatisticsPanel()
+                            }
+                            .frame(width: min(geometry.size.width * 0.4, 640), height: geometry.size.height - 80)
+                            .padding(.vertical, 40)
+                            .padding(.trailing, 48)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                        }
+                    }
+                    .zIndex(5)
+                }
+
+                if showQualityPanel {
+                    GeometryReader { geometry in
+                        HStack {
+                            Spacer()
+                            TVQualitySelectionPanel(
+                                onSelect: { cdnIndex, urlIndex in
+                                    roomInfoViewModel.changePlayUrl(cdnIndex: cdnIndex, urlIndex: urlIndex, selectionOrigin: .user)
+                                    hideQualityPanel()
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                        if playerCoordinator.playerLayer?.player.isPlaying ?? false == false {
+                                            playerCoordinator.playerLayer?.play()
+                                            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                                                roomInfoViewModel.showControlView = false
+                                            }
+                                        }
+                                    }
+                                },
+                                onClose: {
+                                    hideQualityPanel()
+                                }
+                            )
+                            .frame(width: min(geometry.size.width * 0.4, 640), height: geometry.size.height - 80)
+                            .padding(.vertical, 40)
+                            .padding(.trailing, 48)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                        }
+                    }
+                    .zIndex(5)
+                }
+
+                if shouldShowHiddenControlAnchors {
+                    hiddenControlAnchorOverlay
+                        .zIndex(1)
+                }
+
+                if showVolumeHUD {
+                    VStack {
+                        Spacer().frame(height: 90)
+                        volumeHUDView
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity)
+                    .allowsHitTesting(false)
+                    .zIndex(6)
+                }
+
+                if let hint = roomInfoViewModel.danmuStatusHint {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            danmuHintBubble(text: hint)
+                                .transition(.move(edge: .leading).combined(with: .opacity))
+                            Spacer()
+                        }
+                    }
+                    // 左下角,抬到底部控制带(高 150)之上;左边距与播放控制胶囊左缘对齐
+                    // (HStack 起点 0 + 隐藏聚焦按钮 40 + spacing 15 ≈ 55)
+                    .padding(.leading, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.screenInset : 55)
+                    .padding(.bottom, 170)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+                    .zIndex(7)
+                }
+
+                if roomInfoViewModel.showControl {
+                    VStack {
+                        ZStack {
+                            HStack {
+                                Text("\(roomInfoViewModel.currentRoom.userName) - \(titleTranslationEnabled ? RoomTitleTranslationService.shared.displayTitle(for: roomInfoViewModel.currentRoom.roomTitle) : roomInfoViewModel.currentRoom.roomTitle)")
+                                    .roomTitleTranslationTask(
+                                        roomInfoViewModel.currentRoom.roomTitle,
+                                        enabled: titleTranslationEnabled
+                                    )
+                                    .font(.title3)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                    .padding(.leading, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.screenInset : 15)
+                                    .foregroundStyle(.white)
+                                Spacer()
+                            }
+                            .background {
+                                LinearGradient(colors: [
+                                    .black,
+                                    .black.opacity(0.5),
+                                    .black.opacity(0.1),
+                                    .clear,
+                                    .clear,
+                                    .clear,
+                                    .clear,
+                                    .clear,
+                                ], startPoint: .top, endPoint: .bottom)
+                                .frame(height: 150)
+                            }
+                            .frame(height: 150)
+                        }
+                        Spacer()
+                        HStack(alignment: .center, spacing: 15) {
+
+                            if !usesFullUIControlSpacing {
+                            Button(action: {}, label: {
+
+                            })
+                            .padding(.leading, -80)
+                            .clipShape(.circle)
+                            .frame(width: 40, height: 40)
+                            .focused($state, equals: .left)
+                            }
+
+                        VStack {
+                            HStack(spacing: usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.spacing : 0) {
+                                Button(action: {
+                                    guard ensureControlVisible() else { return }
+                                    roomInfoViewModel.togglePlayPause()
+                                }, label: {
+                                    Image(systemName: roomInfoViewModel.userPaused ? "play.fill" : "pause.fill")
+                                        .font(.system(size: 30, weight: .bold))
+                                        .foregroundColor(.white)
+                                        .frame(width: 40, height: 40)
+                                })
+                                .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                             isFocused: state == .playPause, shape: .circle, legacyShape: .circle))
+                                .contextMenu(menuItems: {
+                                    if usesFullUIControlSpacing {
+                                        LiveSubtitleQuickControls(playback: roomInfoViewModel.subtitlePlayback) {
+                                            subtitleActivationID = roomInfoViewModel.subtitlePlayback.activationID
+                                            showSubtitleLanguages = true
+                                        }
+                                    }
+                                    Button {
+                                        showStatisticsAction()
+                                    } label: {
+                                        Label("视频信息统计", systemImage: "chart.bar.xaxis")
+                                    }
+                                })
+                                .modifier(TVFullUISubtitleMenuHintModifier(enabled: usesFullUIControlSpacing))
+                                .focused($state, equals: .playPause)
+
+                                Button(action: {
+                                    refreshAction()
+                                }, label: {
+                                    Image(systemName: "arrow.trianglehead.2.counterclockwise")
+                                        .foregroundColor(.white)
+                                        .font(.system(size: 30, weight: .bold))
+                                        .frame(width: 40, height: 40)
+                                })
+                                .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                             isFocused: state == .refresh, shape: .circle, legacyShape: .circle))
+                                .focused($state, equals: .refresh)
+
+                                Button(action: {
+                                    favoriteBtnAction()
+                                }, label: {
+                                    if roomInfoModel.currentRoomLikeLoading {
+                                        ProgressView()
+                                            .scaleEffect(0.6)
+                                            .frame(width: 40, height: 40)
+                                    }else {
+                                        Image(systemName: "heart.fill")
+                                            .foregroundColor(roomInfoModel.currentRoomIsLiked ? .red : .white)
+                                            .font(.system(size: 30, weight: .bold))
+                                            .frame(width: 40, height: 40)
+                                            .padding(.top, usesFullUIControlSpacing ? 0 : 3)
+                                    }
+                                })
+                                .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                             isFocused: state == .favorite, shape: .circle, legacyShape: .circle))
+                                .focused($state, equals: .favorite)
+                                .changeEffect(
+                                    .spray(origin: UnitPoint(x: 0.25, y: 0.5)) {
+                                        Image(systemName:roomInfoModel.currentRoomIsLiked ? "heart.fill" : "heart.slash.fill" )
+                                        .foregroundStyle(.red)
+                                    }, value: roomInfoModel.currentRoomIsLiked)
+                            }
+                            .modifier(TVFullUIPlayerControlGroupModifier(enabled: usesFullUIControlSpacing,
+                                                                        legacyInsets: EdgeInsets(top: 10, leading: 5, bottom: 10, trailing: 5)))
+
+                            if !usesFullUIControlSpacing {
+                            Button(action: /*@START_MENU_TOKEN@*/{}/*@END_MENU_TOKEN@*/, label: {
+                                Text("")
+                                    .frame(width: 150, height: 40)
+                            })
+                            .focused($state, equals: .list)
+                            .opacity(0.01)
+                            }
+                        }
+                        .padding(.top, usesFullUIControlSpacing ? 0 : 60)
+                       
+                        Spacer()
+                        VStack {
+                            HStack(spacing: usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.spacing : 0) {
+                                if roomInfoViewModel.showControl {
+                                    Button {
+                                        showQualityAction()
+                                    } label: {
+                                        qualityLabel()
+                                    }
+                                    .focused($state, equals: .playQuality)
+                                    .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                                 isFocused: state == .playQuality, shape: .capsule,
+                                                                                 legacyShape: .capsule, legacyHeight: 60))
+                                } else {
+                                    Button(action: {
+                                        roomInfoViewModel.showControl = true
+                                    }, label: {
+                                        qualityLabel()
+                                    })
+                                    .focused($state, equals: .playQuality)
+                                    .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                                 isFocused: state == .playQuality, shape: .capsule,
+                                                                                 legacyShape: .capsule, legacyHeight: 60))
+                                }
+//                                .popoverTip(multiCameraTip, arrowEdge: .top) { _ in
+//                                    // 点击 Tip 后关闭
+//                                }
+
+                                if roomInfoViewModel.supportsDanmu {
+                                    if !usesFullUIControlSpacing {
+                                    Text("")
+                                        .frame(width: 15)
+                                    }
+
+                                    Button(action: {
+                                        guard ensureControlVisible() else { return }
+                                        roomInfoModel.showDanmuSettingView = true
+                                        roomInfoModel.showControl = false
+                                        showDanmuSetting = true
+                                        state = .danmuSetting
+                                    }, label: {
+                                        Image("icon-danmu-setting-focus")
+                                            .resizable()
+                                            .frame(width: 40, height: 40)
+                                    })
+                                    .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                                 isFocused: state == .danmuSetting, shape: .circle, legacyShape: .circle))
+                                    .focused($state, equals: .danmuSetting)
+
+                                    Button(action: {
+                                        danmuAction()
+                                    }, label: {
+                                        Image(appViewModel.danmuSettingsViewModel.showDanmu ? "icon-danmu-open-focus" : "icon-danmu-close-focus")
+                                            .resizable()
+                                            .frame(width: 40, height: 40)
+                                    })
+                                    .modifier(TVFullUIPlayerControlButtonModifier(enabled: usesFullUIControlSpacing,
+                                                                                 isFocused: state == .danmu, shape: .circle, legacyShape: .circle))
+                                    .focused($state, equals: .danmu)
+                                }
+                            }
+                            .modifier(TVFullUIPlayerControlGroupModifier(enabled: usesFullUIControlSpacing,
+                                                                        legacyInsets: EdgeInsets(top: 10, leading: 15, bottom: 10, trailing: 0)))
+                            .onAppear {
+                                if !hasMultiCamera {
+                                    multiCameraTip.invalidate(reason: .actionPerformed)
+                                }
+                            }
+
+                            if !usesFullUIControlSpacing {
+                            Button(action: /*@START_MENU_TOKEN@*/{}/*@END_MENU_TOKEN@*/, label: {
+                                Text("")
+                                    .frame(width: 150, height: 40)
+                            })
+                            .focused($state, equals: .list)
+                            .opacity(0.01)
+                            }
+                        }
+                        .padding(.top, usesFullUIControlSpacing ? 0 : 60)
+                        
+                        if !usesFullUIControlSpacing {
+                        Button(action: {}, label: {
+                            
+                        })
+                        .padding(.trailing, -80)
+                        .clipShape(.circle)
+                        .frame(width: 40, height: 40)
+                        .focused($state, equals: .right)
+                        }
+                    }
+                    .frame(height: usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.height + 2 * TVFullUIPlayerControlMetrics.inset : 150)
+                    .padding(.horizontal, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.screenInset : 0)
+                    .padding(.bottom, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.screenInset : 0)
+                    .modifier(TVFullUIControlMoveModifier(enabled: usesFullUIControlSpacing, action: handleFullUIControlMove))
+                    }
+                    .environment(\.colorScheme, .dark)
+                    .focusSection()
+                    .transition(.opacity)
+                }
+            }
+        }
+        .onAppear {
+            Logger.debug("[VolumeHUD] PlayerControlView appeared, initial volume=\(systemVolumeObserver.volume)", category: .ui)
+            roomInfoViewModel.showControl = true
+            restoreControlFocus()
+        }
+        .sheet(isPresented: $showSubtitleLanguages) {
+            LiveSubtitleLanguageSelectionSheet(
+                playback: roomInfoViewModel.subtitlePlayback,
+                activationID: subtitleActivationID
+            )
+        }
+        .onChange(of: roomInfoViewModel.subtitlePlayback.activationID) { _, _ in
+            showSubtitleLanguages = false
+        }
+        .onChange(of: showSubtitleLanguages) { _, isPresented in
+            subtitleFocusGeneration = UUID()
+            if isPresented {
+                roomInfoViewModel.contolTimer?.invalidate()
+                pendingVisibleFocusAfterReveal = nil
+                state = nil
+            } else {
+                pendingVisibleFocusAfterReveal = .playPause
+                let wasVisible = roomInfoViewModel.showControl
+                roomInfoViewModel.showControl = true
+                if wasVisible {
+                    restoreControlFocus()
+                }
+            }
+        }
+        .onDisappear {
+            subtitleFocusGeneration = UUID()
+            volumeHUDHideTask?.cancel()
+            volumeHUDHideTask = nil
+        }
+        // 订阅 TVSystemVolumeObserver:tick 每次音量回调 +1,触发 HUD
+        // 触发条件:音频路由经 Apple TV 控制(HomePod / AirPods / AirPlay 2)。
+        // HDMI-CEC 让电视自管音量时,系统不会回传给 App,这是平台限制。
+        .onChange(of: systemVolumeObserver.changeTick) { _, _ in
+            presentVolumeHUD()
+        }
+        .onChange(of: appViewModel.danmuSettingsViewModel.showDanmu) { _, isEnabled in
+            guard roomInfoViewModel.supportsDanmu else { return }
+            if isEnabled {
+                roomInfoViewModel.getDanmuInfo()
+            } else {
+                roomInfoViewModel.disConnectSocket()
+            }
+        }
+        .onChange(of: roomInfoViewModel.showControl) { oldValue, isVisible in
+            guard !showSubtitleLanguages else {
+                roomInfoViewModel.contolTimer?.invalidate()
+                return
+            }
+            if isVisible {
+                restoreControlFocus()
+            } else {
+                pendingVisibleFocusAfterReveal = nil
+                restoreHiddenControlFocus()
+            }
+        }
+        .onChange(of: state, { oldValue, newValue in
+            guard !showSubtitleLanguages else { return }
+            roomInfoViewModel.controlViewOptionSecond = 5
+
+            if oldValue != .list && isListContentField(oldValue) == false && oldValue != nil {
+                roomInfoViewModel.lastOptionState = oldValue
+            }
+
+            guard roomInfoViewModel.showTop == false,
+                  roomInfoViewModel.showDanmuSettingView == false,
+                  showStatisticsPanel == false,
+                  showQualityPanel == false else {
+                return
+            }
+
+            if roomInfoViewModel.showControl == false {
+                if suppressHiddenFocusActivation {
+                    suppressHiddenFocusActivation = false
+                }
+                return
+            }
+
+            if newValue == .left {
+                state = roomInfoViewModel.supportsDanmu ? .danmu : .playQuality
+            }else if newValue == .right {
+                state = .playPause
+            }else if newValue == .list {
+                showRelatedRoomsPanel()
+            }
+        })
+        .onExitCommand {
+            logNavigation("exitCommand")
+            handleBackCommand()
+        }
+        .onKeyPress(.escape, phases: .all) { press in
+            logNavigation("escape phase=\(press.phase)")
+            // 原生 Escape 不一定转换为 Exit。消费整个按键，只在松开时返回一层，
+            // 避免按下收起列表后，同一次按键的松开又退出播放。
+            if press.phase == .up {
+                handleBackCommand()
+            }
+            return .handled
+        }
+    }
+
+    private var relatedRoomCards: some View {
+        ForEach(sectionList.indices, id: \.self) { index in
+            PlayerControlCardView { liveModel in
+                changeRoom(liveModel)
+            }
+            .environment(PlayerControlCardViewModel(liveModel: sectionList[index], cardIndex: index, selectIndex: selectIndex))
+        }
+    }
+
+    private func handleBackCommand() {
+        if showSubtitleLanguages {
+            showSubtitleLanguages = false
+            return
+        }
+        if roomInfoViewModel.showTop {
+            logNavigation("closeRelatedRooms")
+            withAnimation {
+                roomInfoViewModel.showTop = false
+            }
+            topState = nil
+            DispatchQueue.main.async {
+                if roomInfoViewModel.showControl {
+                    restoreControlFocus()
+                } else {
+                    restoreHiddenControlFocus()
+                }
+            }
+            return
+        }
+
+        if roomInfoViewModel.showDanmuSettingView {
+            roomInfoViewModel.showDanmuSettingView = false
+            showDanmuSetting = false
+            state = roomInfoViewModel.lastOptionState
+            roomInfoViewModel.showControl = true
+            return
+        }
+
+        if showStatisticsPanel {
+            hideStatisticsPanel()
+            return
+        }
+
+        if showQualityPanel {
+            hideQualityPanel()
+            return
+        }
+
+        if roomInfoViewModel.showControl {
+            logNavigation("hideControls")
+            withAnimation(.easeInOut(duration: 0.2)) {
+                roomInfoViewModel.showControl = false
+            }
+        } else {
+            logNavigation("endPlayback")
+            roomInfoViewModel.stopLiveStatusPolling()
+            NotificationCenter.default.post(name: SimpleLiveNotificationNames.playerEndPlay, object: nil)
+        }
+    }
+
+    private func logNavigation(_ event: String) {
+        let message = "PlayerNavigation \(event) top=\(roomInfoViewModel.showTop) controls=\(roomInfoViewModel.showControl) focus=\(String(describing: state)) topFocus=\(String(describing: topState))"
+        Logger.debug(message, category: .ui)
+        #if DEBUG
+        os_log("%{public}@", log: Self.navigationLog, type: .default, message)
+        #endif
+    }
+
+    private func showStatisticsAction() {
+        guard ensureControlVisible() else { return }
+        roomInfoViewModel.lastOptionState = state ?? .playPause
+        state = nil
+        withAnimation(.easeInOut(duration: 0.28)) {
+            showStatisticsPanel = true
+            roomInfoViewModel.showControl = false
+        }
+    }
+
+    private func hideStatisticsPanel() {
+        withAnimation(.easeInOut(duration: 0.28)) {
+            showStatisticsPanel = false
+            roomInfoViewModel.showControl = true
+        }
+    }
+
+    private func showQualityAction() {
+        guard ensureControlVisible() else { return }
+        roomInfoViewModel.lastOptionState = state ?? .playQuality
+        state = nil
+        withAnimation(.easeInOut(duration: 0.28)) {
+            showQualityPanel = true
+            roomInfoViewModel.showControl = false
+        }
+    }
+
+    private func hideQualityPanel() {
+        withAnimation(.easeInOut(duration: 0.28)) {
+            showQualityPanel = false
+            roomInfoViewModel.showControl = true
+        }
+    }
+
+    private var shouldShowHiddenControlAnchors: Bool {
+        showSubtitleLanguages == false &&
+        roomInfoViewModel.showControl == false &&
+        roomInfoViewModel.showTop == false &&
+        roomInfoViewModel.showDanmuSettingView == false &&
+        showStatisticsPanel == false &&
+        showQualityPanel == false
+    }
+
+    @ViewBuilder
+    private var hiddenControlAnchorOverlay: some View {
+        if usesFullUIControlSpacing {
+            fullUIHiddenControlAnchorOverlay
+        } else {
+            legacyHiddenControlAnchorOverlay
+        }
+    }
+
+    private var fullUIHiddenControlAnchorOverlay: some View {
+        VStack {
+            Spacer()
+            HStack(spacing: 15) {
+                HStack(spacing: TVFullUIPlayerControlMetrics.spacing) {
+                    hiddenControlAnchor(width: 70, height: 70, focus: .playPause)
+                    hiddenControlAnchor(width: 70, height: 70, focus: .refresh)
+                    hiddenControlAnchor(width: 70, height: 70, focus: .favorite)
+                }
+                .padding(TVFullUIPlayerControlMetrics.inset)
+
+                Spacer()
+
+                HStack(spacing: TVFullUIPlayerControlMetrics.spacing) {
+                    hiddenControlAnchor(width: 150, height: 70, focus: .playQuality)
+                    if roomInfoViewModel.supportsDanmu {
+                        hiddenControlAnchor(width: 70, height: 70, focus: .danmuSetting)
+                        hiddenControlAnchor(width: 70, height: 70, focus: .danmu)
+                    }
+                }
+                .padding(TVFullUIPlayerControlMetrics.inset)
+            }
+            .frame(height: TVFullUIPlayerControlMetrics.height + 2 * TVFullUIPlayerControlMetrics.inset)
+            .padding(.horizontal, TVFullUIPlayerControlMetrics.screenInset)
+            .padding(.bottom, TVFullUIPlayerControlMetrics.screenInset)
+        }
+        .focusSection()
+    }
+
+    private var legacyHiddenControlAnchorOverlay: some View {
+        VStack {
+            Spacer()
+            HStack(alignment: .bottom, spacing: 15) {
+                hiddenControlAnchor(width: 40, height: 40, focus: .left)
+                    .padding(.leading, -80)
+
+                VStack(spacing: 20) {
+                    HStack(spacing: usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.spacing : 0) {
+                        hiddenControlAnchor(width: usesFullUIControlSpacing ? 70 : 50, height: usesFullUIControlSpacing ? 70 : 60, focus: .playPause)
+                        hiddenControlAnchor(width: usesFullUIControlSpacing ? 70 : 50, height: usesFullUIControlSpacing ? 70 : 60, focus: .refresh)
+                        hiddenControlAnchor(width: usesFullUIControlSpacing ? 70 : 50, height: usesFullUIControlSpacing ? 70 : 60, focus: .favorite)
+                    }
+                    .padding(.horizontal, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.inset : 5)
+                    .padding(.vertical, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.inset : 10)
+
+                    if !usesFullUIControlSpacing {
+                    hiddenControlAnchor(width: 150, height: 40, focus: .list)
+                    }
+                }
+
+                Spacer()
+
+                VStack(spacing: 20) {
+                    HStack(spacing: usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.spacing : 0) {
+                        hiddenControlAnchor(width: 150, height: 60, focus: .playQuality)
+                        if roomInfoViewModel.supportsDanmu {
+                            Color.clear.frame(width: 15)
+                            hiddenControlAnchor(width: 50, height: 60, focus: .danmuSetting)
+                            hiddenControlAnchor(width: 50, height: 60, focus: .danmu)
+                        }
+                    }
+                    .padding(.leading, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.inset : 15)
+                    .padding(.trailing, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.inset : 0)
+                    .padding(.vertical, usesFullUIControlSpacing ? TVFullUIPlayerControlMetrics.inset : 10)
+
+                    if !usesFullUIControlSpacing {
+                    hiddenControlAnchor(width: 150, height: 40, focus: .list)
+                    }
+                }
+
+                hiddenControlAnchor(width: 40, height: 40, focus: .right)
+                    .padding(.trailing, -80)
+            }
+            .frame(height: 150)
+            .offset(y: 220)
+        }
+        .ignoresSafeArea()
+    }
+
+    private func hiddenControlAnchor(width: CGFloat, height: CGFloat, focus: PlayControlFocusableField) -> some View {
+        Button(action: {
+            pendingVisibleFocusAfterReveal = resolvedVisibleControlFocus(from: focus)
+            roomInfoViewModel.showControl = true
+        }) {
+            if usesFullUIControlSpacing, focus == .playQuality {
+                qualityLabel()
+                    .padding(.horizontal, 24)
+                    .frame(height: TVFullUIPlayerControlMetrics.height)
+                    .hidden()
+                    .contentShape(Rectangle())
+            } else {
+                Color.clear
+                    .frame(width: width, height: height)
+                    .contentShape(Rectangle())
+            }
+        }
+        .modifier(TVFullUIHiddenAnchorStyleModifier(enabled: usesFullUIControlSpacing, focus: focus))
+        .focused($state, equals: focus)
+        .onMoveCommand { direction in
+            handleHiddenAnchorMove(from: focus, direction: direction)
+        }
+    }
+
+    private func restoreControlFocus() {
+        guard showSubtitleLanguages == false,
+              roomInfoViewModel.showTop == false,
+              roomInfoViewModel.showDanmuSettingView == false,
+              showStatisticsPanel == false,
+              showQualityPanel == false else {
+            return
+        }
+
+        let preferredFocus = pendingVisibleFocusAfterReveal ?? (state == .list ? roomInfoViewModel.lastOptionState : (state ?? roomInfoViewModel.lastOptionState))
+        let target = resolvedVisibleControlFocus(from: preferredFocus)
+        let generation = subtitleFocusGeneration
+        DispatchQueue.main.async {
+            guard generation == subtitleFocusGeneration, !showSubtitleLanguages else { return }
+            state = nil
+            DispatchQueue.main.async {
+                guard generation == subtitleFocusGeneration, !showSubtitleLanguages else { return }
+                state = target
+                pendingVisibleFocusAfterReveal = nil
+            }
+        }
+    }
+
+    private func handleHiddenAnchorMove(from focus: PlayControlFocusableField, direction: MoveCommandDirection) {
+        guard shouldShowHiddenControlAnchors else {
+            return
+        }
+
+
+        switch direction {
+        case .down:
+            showRelatedRoomsPanel()
+        case .left, .right:
+            guard let target = nextVisibleFocus(from: focus, direction: direction) else {
+                return
+            }
+
+            pendingVisibleFocusAfterReveal = target
+            withAnimation(.easeInOut(duration: 0.2)) {
+                roomInfoViewModel.showControl = true
+            }
+        default:
+            break
+        }
+    }
+
+    private func restoreHiddenControlFocus() {
+        guard shouldShowHiddenControlAnchors else {
+            return
+        }
+
+        let preferredFocus = state == .list ? roomInfoViewModel.lastOptionState : (state ?? roomInfoViewModel.lastOptionState)
+        let target = resolvedHiddenAnchorFocus(from: preferredFocus)
+        let generation = subtitleFocusGeneration
+
+        suppressHiddenFocusActivation = true
+        DispatchQueue.main.async {
+            guard generation == subtitleFocusGeneration, !showSubtitleLanguages else { return }
+            state = nil
+            DispatchQueue.main.async {
+                guard generation == subtitleFocusGeneration, !showSubtitleLanguages else { return }
+                state = target
+            }
+        }
+    }
+
+    private func showRelatedRoomsPanel() {
+        logNavigation("openRelatedRooms")
+        let initialSection = preferredTopSectionIndex()
+        changeList(initialSection)
+
+        withAnimation(.easeInOut(duration: 0.2)) {
+            roomInfoViewModel.showTop = true
+        }
+
+        DispatchQueue.main.async {
+            guard roomInfoViewModel.showTop else { return }
+            topState = .section(initialSection)
+        }
+    }
+
+    /// 顶部面板是否显示「收藏」Tab。本地优先(Core 模型):有本地收藏就显示,不依赖 iCloud 是否就绪。
+    private var showsFavoriteTopTab: Bool {
+        !appViewModel.favoriteViewModel.roomList.isEmpty
+    }
+
+    private func preferredTopSectionIndex() -> Int {
+        if roomInfoViewModel.roomType == .live {
+            return 2
+        }
+        // 收藏 Tab 渲染了才默认聚焦它,否则退到「历史」(section 1),避免聚焦未渲染的 Tab。
+        return showsFavoriteTopTab ? 0 : 1
+    }
+
+    private func resolvedVisibleControlFocus(from candidate: PlayControlFocusableField?) -> PlayControlFocusableField {
+        if usesFullUIControlSpacing {
+            if candidate == .left { return roomInfoViewModel.supportsDanmu ? .danmu : .playQuality }
+            if candidate == .right { return .playPause }
+            if !roomInfoViewModel.supportsDanmu, candidate == .danmu || candidate == .danmuSetting {
+                return .playQuality
+            }
+        }
+        switch candidate {
+        case .danmu, .danmuSetting:
+            return roomInfoViewModel.supportsDanmu ? (candidate ?? .playQuality) : .playQuality
+        case .refresh, .favorite, .playQuality, .left, .right:
+            return candidate ?? .playPause
+        case .playPause:
+            return .playPause
+        default:
+            return .playPause
+        }
+    }
+
+    private func handleFullUIControlMove(_ direction: MoveCommandDirection) {
+        switch direction {
+        case .down:
+            showRelatedRoomsPanel()
+        case .left where state == .playPause:
+            state = roomInfoViewModel.supportsDanmu ? .danmu : .playQuality
+        case .right where state == (roomInfoViewModel.supportsDanmu ? .danmu : .playQuality):
+            state = .playPause
+        default:
+            break
+        }
+    }
+
+    private func resolvedHiddenAnchorFocus(from candidate: PlayControlFocusableField?) -> PlayControlFocusableField {
+        if usesFullUIControlSpacing {
+            return resolvedVisibleControlFocus(from: candidate)
+        }
+        switch candidate {
+        case .danmu, .danmuSetting:
+            return roomInfoViewModel.supportsDanmu ? (candidate ?? .playQuality) : .playQuality
+        case .playPause, .refresh, .favorite, .playQuality, .list, .left, .right:
+            return candidate ?? .playPause
+        default:
+            return .playPause
+        }
+    }
+
+    private func nextVisibleFocus(from focus: PlayControlFocusableField, direction: MoveCommandDirection) -> PlayControlFocusableField? {
+        if usesFullUIControlSpacing {
+            var controls: [PlayControlFocusableField] = [.playPause, .refresh, .favorite, .playQuality]
+            if roomInfoViewModel.supportsDanmu {
+                controls.append(contentsOf: [.danmuSetting, .danmu])
+            }
+            guard let index = controls.firstIndex(of: resolvedVisibleControlFocus(from: focus)) else { return nil }
+            switch direction {
+            case .left:
+                return controls[(index + controls.count - 1) % controls.count]
+            case .right:
+                return controls[(index + 1) % controls.count]
+            default:
+                return nil
+            }
+        }
+        switch (focus, direction) {
+        case (.left, .right):
+            return .playPause
+        case (.playPause, .left):
+            return .left
+        case (.playPause, .right):
+            return .refresh
+        case (.refresh, .left):
+            return .playPause
+        case (.refresh, .right):
+            return .favorite
+        case (.favorite, .left):
+            return .refresh
+        case (.favorite, .right):
+            return .playQuality
+        case (.playQuality, .left):
+            return .favorite
+        case (.playQuality, .right):
+            return roomInfoViewModel.supportsDanmu ? .danmuSetting : .right
+        case (.danmuSetting, .left):
+            return .playQuality
+        case (.danmuSetting, .right):
+            return .danmu
+        case (.danmu, .left):
+            return .danmuSetting
+        case (.danmu, .right):
+            return .right
+        case (.right, .left):
+            return roomInfoViewModel.supportsDanmu ? .danmu : .playQuality
+        default:
+            return nil
+        }
+    }
+    
+    /// 带超时的直播状态查询：超时按"查不到"处理，不阻塞收藏。
+    private static func fetchLiveStateBestEffort(_ room: LiveModel) async throws -> LiveState {
+        try await withThrowingTaskGroup(of: LiveState.self) { group in
+            group.addTask {
+                try await ApiManager.getCurrentRoomLiveState(
+                    roomId: room.roomId,
+                    userId: room.userId,
+                    liveType: room.liveType
+                )
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                throw CancellationError()
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else {
+                throw CancellationError()
+            }
+            return first
+        }
+    }
+
+    func favoriteAction() {
+        roomInfoViewModel.currentRoomLikeLoading = true
+        let isAdding = appViewModel.favoriteViewModel.roomList.contains(where: { roomInfoViewModel.currentRoom == $0 }) == false
+        Task { @MainActor in
+            defer { roomInfoViewModel.currentRoomLikeLoading = false }
+            do {
+                if isAdding {
+                    // 直播状态只是附加信息：查询失败或超时都不能阻断收藏本身，
+                    // 否则用户看到的是"点了没反应、也没进本地收藏"。
+                    if let liveState = try? await Self.fetchLiveStateBestEffort(roomInfoViewModel.currentRoom) {
+                        roomInfoViewModel.currentRoom.liveState = liveState.rawValue
+                    }
+                    try await appViewModel.favoriteViewModel.addFavorite(room: roomInfoViewModel.currentRoom)
+                    roomInfoViewModel.currentRoomIsLiked = true
+                    roomInfoViewModel.showToast(true, title: "收藏成功")
+                } else {
+                    try await appViewModel.favoriteViewModel.removeFavoriteRoom(room: roomInfoViewModel.currentRoom)
+                    roomInfoViewModel.currentRoomIsLiked = false
+                    roomInfoViewModel.showToast(true, title: "取消收藏成功")
+                }
+                TopShelfManager.notifyContentChanged()
+            } catch {
+                let detail = FavoriteService.formatErrorCode(error: error)
+                roomInfoViewModel.showToast(false, title: isAdding ? "收藏失败：\(detail)" : "取消收藏失败：\(detail)")
+            }
+        }
+    }
+
+    func refreshAction() {
+        guard ensureControlVisible() else { return }
+        roomInfoViewModel.refreshPlayback()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: {
+            if playerCoordinator.playerLayer?.player.isPlaying ?? false == false {
+                playerCoordinator.playerLayer?.play()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: {
+                    roomInfoViewModel.showControlView = false
+                })
+            }
+        })
+    }
+    
+    func favoriteBtnAction() {
+        guard ensureControlVisible() else { return }
+        favoriteAction()
+    }
+    
+    func danmuAction() {
+        guard ensureControlVisible() else { return }
+        guard roomInfoViewModel.supportsDanmu else { return }
+        appViewModel.danmuSettingsViewModel.showDanmu.toggle()
+    }
+
+    @discardableResult
+    private func ensureControlVisible() -> Bool {
+        if roomInfoViewModel.showControl == false {
+            roomInfoViewModel.showControl = true
+            return false
+        }
+        return true
+    }
+
+    private func presentVolumeHUD() {
+        volumeHUDHideTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.18)) {
+            showVolumeHUD = true
+        }
+        volumeHUDHideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_300_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                showVolumeHUD = false
+            }
+        }
+    }
+
+
+    private func volumeIconName(for value: Float) -> String {
+        if value <= 0.001 {
+            return "speaker.slash.fill"
+        } else if value < 0.34 {
+            return "speaker.wave.1.fill"
+        } else if value < 0.67 {
+            return "speaker.wave.2.fill"
+        } else {
+            return "speaker.wave.3.fill"
+        }
+    }
+
+    private func volumeIcon(for value: Float) -> some View {
+        Image(systemName: volumeIconName(for: value))
+            .font(.system(size: 26, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 36)
+            .contentTransition(.symbolEffect(.replace))
+    }
+
+    private var volumeHUDView: some View {
+        let raw = systemVolumeObserver.volume
+        let value = CGFloat(max(0.0, min(1.0, raw)))
+        return HStack(spacing: 14) {
+            volumeIcon(for: raw)
+
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(.white.opacity(0.25))
+                    Capsule()
+                        .fill(.white)
+                        .frame(width: max(2, geo.size.width * value))
+                }
+            }
+            .frame(width: 280, height: 8)
+
+            Text("\(Int((value * 100).rounded()))")
+                .font(.system(size: 20, weight: .semibold).monospacedDigit())
+                .foregroundStyle(.white)
+                .frame(width: 44, alignment: .trailing)
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 14)
+        .adaptiveGlassEffectCapsule()
+    }
+
+    /// 弹幕状态气泡:黑色半透明胶囊 + 白字
+    private func danmuHintBubble(text: String) -> some View {
+        Text(text)
+            .font(.system(size: 24, weight: .medium))
+            .lineLimit(1)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 14)
+            .background(.black.opacity(0.6), in: Capsule())
+    }
+
+    @ViewBuilder
+    private func qualityLabel() -> some View {
+        if usesFullUIControlSpacing {
+            Text(roomInfoViewModel.currentPlayQualityString)
+                .font(.system(size: 30, weight: .bold))
+                .lineLimit(1)
+                .foregroundStyle(.white)
+        } else if #available(tvOS 26.0, *) {
+            Text(roomInfoViewModel.currentPlayQualityString)
+                .font(.system(size: 30, weight: .bold))
+                .frame(height: 50, alignment: .center)
+                .foregroundStyle(.white)
+        }else {
+            Text(roomInfoViewModel.currentPlayQualityString)
+                .font(.system(size: 30, weight: .bold))
+                .frame(height: 50, alignment: .center)
+                .padding(.top, 10)
+                .foregroundStyle(.white)
+        }
+    }
+    
+    func isListContentField(_ field: PlayControlFocusableField?) -> Bool {
+        if case .listContent(_) = field {
+            return true
+        }
+        return false
+    }
+    
+    @MainActor func changeRoom(_ liveModel: LiveModel) {
+        if liveModel.liveState == "" || liveModel.liveState == LiveState.unknow.rawValue {
+            roomInfoViewModel.showToast(false, title: "请等待房间状态同步")
+        }else if liveModel.liveState == LiveState.close.rawValue {
+            roomInfoViewModel.showToast(false, title: "主播已经下播")
+        }else {
+            roomInfoViewModel.reloadRoom(liveModel: liveModel)
+        }
+    }
+    
+    func changeList(_ index: Int) {
+        selectIndex = index
+        sectionList.removeAll()
+        switch index {
+            case 0:
+                for item in appViewModel.favoriteViewModel.roomList {
+                    if item.liveState ?? "0" == LiveState.live.rawValue {
+                        sectionList.append(item)
+                    }
+                }
+            case 1:
+                Task {
+                    for item in appViewModel.historyViewModel.watchList {
+                        sectionList.append(item)
+                    }
+                }
+            case 2:
+                sectionList.append(contentsOf: roomInfoViewModel.roomList)
+            default:
+                break
+        }
+    }
+    
+}
+
+private struct TVFullUISubtitleMenuHintModifier: ViewModifier {
+    let enabled: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.accessibilityHint("聚焦此播放或暂停按钮后，长按遥控器选择键打开字幕菜单。")
+        } else {
+            content
+        }
+    }
+}
+
+private struct TVFullUIControlMoveModifier: ViewModifier {
+    let enabled: Bool
+    let action: (MoveCommandDirection) -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled { content.onMoveCommand(perform: action) }
+        else { content }
+    }
+}
+
+private struct TVFullUIHiddenAnchorStyleModifier: ViewModifier {
+    let enabled: Bool
+    let focus: PlayControlFocusableField
+
+    private var accessibilityLabel: String {
+        switch focus {
+        case .playPause: "显示播放控制，播放与暂停"
+        case .refresh: "显示播放控制，刷新"
+        case .favorite: "显示播放控制，收藏"
+        case .playQuality: "显示播放控制，清晰度"
+        case .danmuSetting: "显示播放控制，弹幕设置"
+        case .danmu: "显示播放控制，弹幕开关"
+        default: "显示播放控制"
+        }
+    }
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content
+                .buttonStyle(TVFullUIHiddenControlButtonStyle())
+                .accessibilityLabel(accessibilityLabel)
+        }
+        else { content.buttonStyle(.plain) }
+    }
+}

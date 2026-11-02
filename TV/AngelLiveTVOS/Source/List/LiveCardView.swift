@@ -1,0 +1,590 @@
+//
+//  LiveCardView.swift
+//  SimpleLiveTVOS
+//
+//  Created by pangchong on 2023/10/9.
+//
+
+import SwiftUI
+import Observation
+import Kingfisher
+import AngelLiveCore
+import AngelLiveDependencies
+
+/// 封面按卡片显示尺寸降采样解码，避免大图整帧解码占用内存与 CPU。
+/// blur 图与前景图共用同一处理链，命中同一份缓存，二次读取不再解码。
+private struct CardCoverProcessor: ImageProcessor {
+    let size: CGSize
+
+    let identifier = "com.angellive.cardcover"
+
+    func process(item: ImageProcessItem, options: KingfisherParsedOptionsInfo) -> KFCrossPlatformImage? {
+        let maxPixel = max(size.width, size.height) * 2
+        switch item {
+        case .image(let image):
+            guard let data = image.kf.data(format: .unknown) else { return nil }
+            return KingfisherWrapper.downsampledImage(data: data, to: CGSize(width: maxPixel, height: maxPixel), scale: 1)
+        case .data(let data):
+            return KingfisherWrapper.downsampledImage(data: data, to: CGSize(width: maxPixel, height: maxPixel), scale: 1)
+        }
+    }
+}
+
+/// 同一 URL 在网格中反复出现（多 rail/搜索结果/收藏），合并并发同 URL 请求，
+/// 避免同一封面被多次下载+解码（Kingfisher 默认会重复解码）。
+private final class CardCoverLoader: @unchecked Sendable {
+    static let shared = CardCoverLoader()
+    private var loadedURLs = Set<String>()
+
+    func preload(_ urls: [String]) {
+        let pending: [URL] = urls.compactMap(URL.init(string:)).filter { loadedURLs.insert($0.absoluteString).inserted }
+        guard !pending.isEmpty else { return }
+        let downloader = ImageDownloader.default
+        for url in pending {
+            downloader.downloadImage(with: url, options: nil) { [weak self] _ in
+                _ = self // 保持实例存活贯穿回调
+            }
+        }
+    }
+}
+
+struct LiveCardView: View {
+
+    @Environment(LiveViewModel.self) var liveViewModel
+    @Environment(AppState.self) var appViewModel
+    let index: Int
+    var externalFocusState: FocusState<FocusableField?>.Binding?
+    var onMoveCommand: ((MoveCommandDirection) -> Void)? = nil
+    var currentLiveModel: LiveModel? = nil
+    // LiveModel 的相等判断只比较房间身份。收藏数据版本作为独立输入，
+    // 让同一房间的新封面、标题等内容触发视图更新，不重建卡片或焦点状态。
+    var contentRevision: Int = 0
+    var cardWidth: CGFloat = 370
+    var coverHeight: CGFloat = 210
+    /// FullUI history owns selection and deletion by stable record identity.
+    var historySelection: (() -> Void)? = nil
+    var historyDeletion: (() -> Void)? = nil
+    var historyFocusID: String? = nil
+    @State private var isLive: Bool = false
+    @State private var historyPlaybackTask: Task<Void, Never>?
+    @FocusState private var internalFocusState: FocusableField?
+
+    /// 卡片底部渐变，用于显示观看人数
+    private let cardGradient = LinearGradient(stops: [
+        .init(color: .black.opacity(0.6), location: 0.0),
+        .init(color: .black.opacity(0.3), location: 0.5),
+        .init(color: .clear, location: 1.0)
+    ], startPoint: .bottom, endPoint: .top)
+    /// 是否获得焦点
+    private var isFocused: Bool {
+        if let external = externalFocusState {
+            return external.wrappedValue == focusValue
+        }
+        return internalFocusState == focusValue
+    }
+
+    private var focusValue: FocusableField {
+        historyFocusID.map(FocusableField.historyContent) ?? .mainContent(index)
+    }
+
+    /// 获取当前 focusState 的值
+    private var currentFocusValue: FocusableField? {
+        externalFocusState?.wrappedValue ?? internalFocusState
+    }
+
+    private func titleTranslationEnabled(for room: LiveModel) -> Bool {
+        historySelection == nil
+            && appViewModel.pluginAvailability.hasAvailablePlugins
+            && SandboxPluginCatalog.platform(for: room.liveType) != nil
+    }
+
+    private var coverProcessor: CardCoverProcessor {
+        CardCoverProcessor(size: CGSize(width: cardWidth, height: coverHeight))
+    }
+
+    var body: some View {
+        if self.currentLiveModel != nil || index < liveViewModel.roomList.count {
+            @Bindable var liveModel = liveViewModel
+            let currentLiveModel = self.currentLiveModel ?? liveViewModel.roomList[index]
+            VStack(alignment: .leading, spacing: 12) {
+                // 封面区域
+                coverSection(currentLiveModel: currentLiveModel, liveModel: $liveModel)
+
+                // 主播信息区域
+                streamerInfoSection(currentLiveModel: currentLiveModel)
+            }
+        }
+    }
+
+    // MARK: - 封面区域
+    @ViewBuilder
+    private func coverSection(currentLiveModel: LiveModel, liveModel: Bindable<LiveViewModel>) -> some View {
+        Button {
+            enterDetailRoom()
+        } label: {
+            ZStack(alignment: .topLeading) {
+                ZStack(alignment: .bottom) {
+                    // 背景模糊层
+                    KFImage(URL(string: currentLiveModel.roomCover))
+                        .placeholder {
+                            placeholderImage
+                        }
+                        .setProcessor(coverProcessor)
+                        .fade(duration: 0.2)
+                        .cacheMemoryOnly()
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: cardWidth, height: coverHeight)
+                        .blur(radius: 15)
+                        .clipped()
+
+                    // 前景封面图
+                    KFImage(URL(string: currentLiveModel.roomCover))
+                        .onFailure { error in
+                            Logger.warning("Image loading failed: \(error)", category: .ui)
+                        }
+                        .placeholder {
+                            placeholderImage
+                        }
+                        .setProcessor(coverProcessor)
+                        .fade(duration: 0.2)
+                        .cacheMemoryOnly()
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: cardWidth, height: coverHeight)
+
+                    // 底部渐变遮罩
+                    Rectangle()
+                        .fill(cardGradient)
+                        .frame(height: 50)
+
+                    // 观看人数标签
+                    if let watchedCount = currentLiveModel.liveWatchedCount {
+                        HStack {
+                            Spacer()
+                            watchedCountBadge(count: watchedCount)
+                        }
+                        .padding(.trailing, 10)
+                        .padding(.bottom, 8)
+                    }
+                }
+                .frame(width: cardWidth, height: coverHeight)
+
+                // TODO: 平台图标和直播状态暂时隐藏，待重新设计后恢复
+//                // 平台和直播状态标签（非直播列表页面显示）
+//                if liveViewModel.roomListType != .live {
+//                    platformAndStatusOverlay(currentLiveModel: currentLiveModel)
+//                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.card)
+        .accessibilityIdentifier(historyFocusID.map { "history.card.\($0)" } ?? "live.card.\(currentLiveModel.id)")
+        .focused(externalFocusState ?? $internalFocusState, equals: focusValue)
+        .onMoveCommand { direction in
+            Logger.debug("LiveCardView onMoveCommand index=\(index) direction=\(direction)", category: .ui)
+            onMoveCommand?(direction)
+        }
+        .onChange(of: currentFocusValue) { oldValue, newValue in
+            handleFocusChange(newValue: newValue, liveModel: liveModel)
+        }
+        .alert("提示", isPresented: liveModel.showAlert) {
+            alertButtons
+        } message: {
+            Text("确认取消收藏吗")
+        }
+        .contextMenu { contextMenuContent }
+        .fullScreenCover(isPresented: $isLive, onDismiss: restoreShortDramaCardFocus) {
+            playerFullScreenContent
+        }
+        .onDisappear {
+            guard historyDeletion != nil else { return }
+            historyPlaybackTask?.cancel()
+            historyPlaybackTask = nil
+        }
+    }
+
+    // MARK: - 主播信息区域
+    @ViewBuilder
+    private func streamerInfoSection(currentLiveModel: LiveModel) -> some View {
+        HStack(spacing: 12) {
+            // 主播头像
+            Group {
+                if !currentLiveModel.userHeadImg.isEmpty,
+                   let avatarURL = URL(string: currentLiveModel.userHeadImg) {
+                    KFImage(avatarURL)
+                        .placeholder { avatarFallback }
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    avatarFallback
+                }
+            }
+            .frame(width: 44, height: 44)
+            .clipShape(Circle())
+            .overlay(
+                Circle()
+                    .stroke(Color.white.opacity(isFocused ? 0.3 : 0), lineWidth: 2)
+            )
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(currentLiveModel.userName.orDash)
+                    .font(.system(size: 20, weight: .semibold))
+                    .lineLimit(1)
+                Group {
+                    if titleTranslationEnabled(for: currentLiveModel) {
+                        TranslatedRoomTitle(currentLiveModel.roomTitle.orDash)
+                    } else {
+                        Text(currentLiveModel.roomTitle.orDash)
+                    }
+                }
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.top, isFocused ? 16 : 8)
+        .scaleEffect(isFocused ? 1.05 : 1.0, anchor: .leading)
+        .animation(.spring(response: 0.35, dampingFraction: 0.7), value: isFocused)
+    }
+
+    // MARK: - 子视图组件
+
+    /// 占位图
+    private var placeholderImage: some View {
+        Image("placeholder")
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(width: cardWidth, height: coverHeight)
+    }
+
+    /// 头像兜底（URL 空 / 加载失败）
+    private var avatarFallback: some View {
+        Circle()
+            .fill(Color.gray.opacity(0.3))
+            .overlay(
+                Image(systemName: "person.fill")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundColor(.white.opacity(0.7))
+                    .padding(6)
+            )
+    }
+
+    /// 观看人数标签
+    private func watchedCountBadge(count: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "eye.fill")
+                .font(.system(size: 12))
+            Text(count.formatWatchedCount())
+                .font(.system(size: 14, weight: .medium))
+        }
+        .foregroundColor(.white)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.5))
+        )
+    }
+
+    // TODO: 平台图标和直播状态暂时隐藏，待重新设计后恢复
+//    /// 平台和直播状态覆盖层
+//    @ViewBuilder
+//    private func platformAndStatusOverlay(currentLiveModel: LiveModel) -> some View {
+//        HStack {
+//            // 平台图标
+//            Image(uiImage: TVPlatformIconProvider.tabImage(for: currentLiveModel.liveType) ?? UIImage())
+//                .resizable()
+//                .frame(width: 36, height: 36)
+//                .clipShape(RoundedRectangle(cornerRadius: 6))
+//                .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
+//                .padding(.top, 8)
+//                .padding(.leading, 8)
+//
+//            Spacer()
+//
+//            // 直播状态标签
+//            liveStatusBadge(currentLiveModel: currentLiveModel)
+//                .padding(.top, 8)
+//                .padding(.trailing, 8)
+//        }
+//        .task {
+//            do {
+//                try await refreshStateIfStateIsUnknow()
+//            } catch {
+//                // 静默处理错误
+//            }
+//        }
+//    }
+//
+//    /// 直播状态标签
+//    private func liveStatusBadge(currentLiveModel: LiveModel) -> some View {
+//        HStack(spacing: 5) {
+//            Circle()
+//                .fill(formatLiveStateColor())
+//                .frame(width: 8, height: 8)
+//            Text(currentLiveModel.liveStateFormat())
+//                .font(.system(size: 14, weight: .medium))
+//                .foregroundColor(.white)
+//        }
+//        .padding(.horizontal, 10)
+//        .padding(.vertical, 6)
+//        .background(
+//            Capsule()
+//                .fill(Color.black.opacity(0.6))
+//        )
+//    }
+
+    /// Alert 按钮
+    private var alertButtons: some View {
+        Group {
+            Button("取消收藏", role: .destructive) {
+                Task {
+                    do {
+                        try await appViewModel.favoriteViewModel.removeFavoriteRoom(room: liveViewModel.currentRoom!)
+                        liveViewModel.showToast(true, title: "取消收藏成功")
+                        TopShelfManager.notifyContentChanged()
+                    } catch {
+                        liveViewModel.showToast(false, title: FavoriteService.formatErrorCode(error: error))
+                    }
+                }
+            }
+            Button("再想想", role: .cancel) {
+                liveViewModel.showAlert = false
+            }
+        }
+    }
+
+    /// 上下文菜单内容
+    @ViewBuilder
+    private var contextMenuContent: some View {
+        if historySelection != nil {
+            if historyDeletion != nil {
+                historyDeleteButton
+            }
+        } else {
+            standardContextMenuContent
+        }
+    }
+
+    @ViewBuilder
+    private var standardContextMenuContent: some View {
+        if liveViewModel.currentRoomIsFavorited {
+            Button {
+                Task {
+                    do {
+                        try await appViewModel.favoriteViewModel.removeFavoriteRoom(room: liveViewModel.currentRoom!)
+                        liveViewModel.showToast(true, title: "取消收藏成功")
+                        liveViewModel.currentRoomIsFavorited = false
+                        TopShelfManager.notifyContentChanged()
+                    } catch {
+                        liveViewModel.showToast(false, title: FavoriteService.formatErrorCode(error: error))
+                    }
+                }
+            } label: {
+                Label("取消收藏", systemImage: "heart.slash.fill")
+            }
+        } else {
+            Button {
+                Task {
+                    do {
+                        if liveViewModel.currentRoom!.liveState == nil || (liveViewModel.currentRoom!.liveState ?? "").isEmpty {
+                            liveViewModel.currentRoom!.liveState = try await ApiManager.getCurrentRoomLiveState(
+                                roomId: liveViewModel.currentRoom!.roomId,
+                                userId: liveViewModel.currentRoom!.userId,
+                                liveType: liveViewModel.currentRoom!.liveType
+                            ).rawValue
+                        }
+                        try await appViewModel.favoriteViewModel.addFavorite(room: liveViewModel.currentRoom!)
+                        liveViewModel.showToast(true, title: "收藏成功")
+                        liveViewModel.currentRoomIsFavorited = true
+                        TopShelfManager.notifyContentChanged()
+                    } catch {
+                        liveViewModel.showToast(false, title: FavoriteService.formatErrorCode(error: error))
+                    }
+                }
+            } label: {
+                Label("收藏", systemImage: "heart.fill")
+            }
+        }
+
+        if liveViewModel.roomListType == .history {
+            historyDeleteButton
+        }
+    }
+
+    private var historyDeleteButton: some View {
+        Button(role: .destructive) {
+            if let historyDeletion {
+                historyDeletion()
+            } else {
+                liveViewModel.deleteHistory(index: index)
+            }
+        } label: {
+            Label("删除", systemImage: "trash")
+        }
+        .accessibilityIdentifier("history.delete")
+    }
+
+    /// 播放器全屏内容
+    @ViewBuilder
+    private var playerFullScreenContent: some View {
+        if let room = liveViewModel.shortDramaRoom {
+            TVShortDramaPlayerView(room: room) {
+                isLive = false
+            }
+            .id(room.id)
+        } else if liveViewModel.roomInfoViewModel != nil {
+            DetailPlayerView { isLive, hint in
+                self.isLive = isLive
+            }
+            .environment(liveViewModel.roomInfoViewModel!)
+            .environment(appViewModel)
+            .edgesIgnoringSafeArea(.all)
+            .frame(width: 1920, height: 1080)
+        }
+    }
+
+    // MARK: - 事件处理
+
+    private func restoreShortDramaCardFocus() {
+        // Keep the FullUI short-drama content alive through cover dismissal;
+        // clearing it in onExit removes its focused view before the transition ends.
+        guard liveViewModel.shortDramaRoom != nil else { return }
+        liveViewModel.shortDramaRoom = nil
+        if let externalFocusState {
+            externalFocusState.wrappedValue = focusValue
+        } else {
+            internalFocusState = focusValue
+        }
+    }
+
+    private func handleFocusChange(newValue: FocusableField?, liveModel: Bindable<LiveViewModel>) {
+        guard newValue == focusValue else { return }
+        guard historySelection == nil else { return }
+        if historyDeletion != nil, let currentLiveModel {
+            liveViewModel.currentRoom = currentLiveModel
+            liveViewModel.selectedRoomListIndex = index
+            return
+        }
+        guard index < liveViewModel.roomList.count else { return }
+
+        liveViewModel.currentRoom = liveViewModel.roomList[index]
+        liveViewModel.selectedRoomListIndex = index
+        if liveViewModel.roomListType == .search {
+            if index >= liveViewModel.roomList.count - 4 {
+                liveViewModel.searchRequest.loadMore()
+            }
+        } else if liveViewModel.roomListType == .live {
+            if index >= liveViewModel.roomList.count - 4 && liveViewModel.hasMoreRooms && !liveViewModel.isLoading {
+                liveViewModel.roomPage += 1
+            }
+        }
+    }
+
+    private func enterDetailRoom() {
+        if let historySelection {
+            historySelection()
+            return
+        }
+        if historyDeletion != nil {
+            historyPlaybackTask?.cancel()
+            historyPlaybackTask = nil
+        }
+        liveViewModel.currentRoom = currentLiveModel ?? liveViewModel.roomList[index]
+        liveViewModel.selectedRoomListIndex = index
+
+        if let room = liveViewModel.currentRoom,
+           TVShortDramaRoute.matches(room: room, appViewModel: appViewModel) {
+            proceedToPlayer()
+            return
+        }
+
+        let isPlayableRoom = liveViewModel.currentRoom.map(PlatformHostBehavior.isPlayableRoom) ?? false
+
+        if isPlayableRoom || liveViewModel.roomListType == .live {
+            proceedToPlayer()
+            return
+        }
+
+        // 搜索/收藏/历史等列表的 liveState 可能为空或过期,先拉一次实时状态再判定
+        guard let room = liveViewModel.currentRoom else { return }
+        let playbackTask = Task {
+            do {
+                let state = try await ApiManager.getCurrentRoomLiveState(
+                    roomId: room.roomId,
+                    userId: room.userId,
+                    liveType: room.liveType
+                )
+                await MainActor.run {
+                    guard !Task.isCancelled, liveViewModel.currentRoom?.id == room.id else { return }
+                    var updatedRoom = room
+                    updatedRoom.liveState = state.rawValue
+                    if liveViewModel.roomListType == .search {
+                        liveViewModel.searchRequest.updateRoomLiveState(id: room.id, state: state.rawValue)
+                    } else if let roomIndex = liveViewModel.roomList.firstIndex(where: { $0.id == room.id }) {
+                        liveViewModel.roomList[roomIndex] = updatedRoom
+                    }
+                    liveViewModel.currentRoom = updatedRoom
+                    if PlatformHostBehavior.isPlayableRoom(updatedRoom) {
+                        proceedToPlayer()
+                    } else {
+                        liveViewModel.showToast(false, title: "主播已经下播")
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard !Task.isCancelled, liveViewModel.currentRoom?.id == room.id else { return }
+                    liveViewModel.showToast(false, title: "状态获取失败,请稍后再试")
+                }
+            }
+        }
+        if historyDeletion != nil { historyPlaybackTask = playbackTask }
+    }
+
+    private func proceedToPlayer() {
+        guard let currentRoom = liveViewModel.currentRoom else { return }
+        if !TVShortDramaRoute.matches(room: currentRoom, appViewModel: appViewModel),
+           !appViewModel.historyViewModel.watchList.contains(where: { currentRoom.roomId == $0.roomId }) {
+            appViewModel.historyViewModel.watchList.insert(currentRoom, at: 0)
+        }
+        let enterFromLive = liveViewModel.roomListType == .live
+        liveViewModel.createCurrentRoomViewModel(enterFromLive: enterFromLive)
+        if historyDeletion != nil {
+            isLive = true
+        } else {
+            DispatchQueue.main.async {
+                isLive = true
+            }
+        }
+    }
+
+//    func formatLiveStateColor() -> Color {
+//        let currentLiveModel = self.currentLiveModel == nil ? liveViewModel.roomList[index] : self.currentLiveModel!
+//        if LiveState(rawValue: currentLiveModel.liveState ?? "3") == .live || LiveState(rawValue:currentLiveModel.liveState ?? "3") == .video {
+//            return Color.green
+//        }else {
+//            return Color.gray
+//        }
+//    }
+//
+//    func refreshStateIfStateIsUnknow() async throws {
+//        guard index < liveViewModel.roomList.count else { return }
+//
+//        let currentLiveModel: LiveModel
+//        if let existingModel = self.currentLiveModel {
+//            currentLiveModel = existingModel
+//        } else {
+//            currentLiveModel = liveViewModel.roomList[index]
+//        }
+//
+//        if currentLiveModel.liveState == "" {
+//            let newState = try await ApiManager.getCurrentRoomLiveState(roomId: currentLiveModel.roomId, userId: currentLiveModel.userId, liveType: currentLiveModel.liveType)
+//            await MainActor.run {
+//                self.currentLiveModel?.liveState = newState.rawValue
+//            }
+//        }
+//    }
+}

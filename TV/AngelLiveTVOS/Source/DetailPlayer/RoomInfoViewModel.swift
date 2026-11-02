@@ -1,0 +1,1176 @@
+//
+//  RoomInfoStore.swift
+//  SimpleLiveTVOS
+//
+//  Created by pc on 2024/1/2.
+//
+
+import Foundation
+import Observation
+import SwiftUI
+import AngelLiveCore
+import AngelLiveDependencies
+
+/// 播放器显示状态
+enum PlayerDisplayState {
+    case loading
+    case playing
+    case error
+    case streamerOffline  // 主播已下播
+}
+
+@Observable
+final class RoomInfoViewModel {
+    let subtitlePlayback = LiveSubtitlePlaybackState()
+
+    var appViewModel: AppState
+
+    var roomList: [LiveModel] = []
+    var currentRoom: LiveModel
+    var currentRoomIsLiked = false
+    var currentRoomLikeLoading = false
+
+    let settingModel = SettingStore()
+    var playerOption: PlayerOptions
+    var currentRoomPlayArgs: [LiveQualityModel]?
+    var currentPlayURL: URL?
+    var currentPlayQualityString = "清晰度"
+    var currentPlayQualityQn = 0
+    var currentCdnIndex = 0      // 当前选中的线路索引
+    var currentQualityIndex = 0  // 当前选中的清晰度索引
+    var showControlView: Bool = true
+    var isPlaying = false
+    var userPaused = false  // 跟踪用户是否手动暂停
+    weak var playerCoordinator: KSVideoPlayer.Coordinator?
+    private var qualitySwitchTask: Task<Void, Never>?
+
+    // MARK: - 统一播放恢复协调器
+    /// 卡顿检测 + 自动恢复的单一状态机,替换原 stall watchdog + managed retry(与 iOS/macOS 共用一份)。
+    /// 状态机本体在 AngelLiveCore(可单测);胶水(采样/动作映射)在 AngelLiveDependencies。
+    /// 当前监视的 playerLayer,供 sample provider 读取 KSPlayer dynamicInfo。
+    weak var watchedPlayerLayer: KSPlayerLayer?
+    @ObservationIgnored private var _recoveryCoordinator: PlaybackRecoveryCoordinator?
+    private var _playbackDiagnostics: PlaybackDiagnosticsSession?
+    @ObservationIgnored private var playbackSelectionGeneration = UUID()
+    @ObservationIgnored private var playbackRequestGeneration = UUID()
+    @ObservationIgnored private var playbackDiagnosticsEnded = false
+    @ObservationIgnored private var playbackDiagnosticsSuspended = false
+    @ObservationIgnored private var hasSelectedInitialPlayback = false
+
+    @MainActor
+    var playbackDiagnostics: PlaybackDiagnosticsSession {
+        if let session = _playbackDiagnostics { return session }
+        let session = PlaybackDiagnosticsSession()
+        _playbackDiagnostics = session
+        return session
+    }
+
+    @MainActor var startupStage: PlaybackStartupStage { playbackDiagnostics.startupStage }
+    @MainActor var recoveryNotice: PlaybackRecoveryNotice? { playbackDiagnostics.recoveryNotice }
+    @MainActor var hasObservedPlaybackProgress: Bool { playbackDiagnostics.hasStartedPlayback }
+
+    @MainActor
+    func interruptPlaybackDiagnostics() {
+        playbackDiagnosticsSuspended = true
+        _playbackDiagnostics?.interruptStartup()
+    }
+
+    @MainActor
+    func endPlaybackDiagnostics() {
+        stopLiveStatusPolling()
+        playbackDiagnosticsEnded = true
+        playbackSelectionGeneration = UUID()
+        playbackRequestGeneration = UUID()
+        _playbackDiagnostics?.end()
+    }
+
+    @MainActor
+    private func recordAssignedSource() {
+        guard !playbackDiagnosticsEnded,
+              let args = currentRoomPlayArgs, args.indices.contains(currentCdnIndex) else { return }
+        playbackDiagnostics.sourceAssigned(
+            pluginID: SandboxPluginCatalog.platform(for: currentRoom.liveType)?.pluginId ?? currentRoom.liveType.rawValue,
+            lineID: args[currentCdnIndex].cdn,
+            line: currentCdnIndex,
+            quality: currentQualityIndex
+        )
+        if playbackDiagnosticsSuspended { playbackDiagnostics.interruptStartup() }
+    }
+
+    /// 懒构造(协调器 init 为 @MainActor;@Observable 不支持 lazy 存储属性,故手写)。
+    @MainActor
+    var recoveryCoordinator: PlaybackRecoveryCoordinator {
+        if let c = _recoveryCoordinator { return c }
+        let c = makeRecoveryCoordinator()
+        _recoveryCoordinator = c
+        return c
+    }
+
+    @MainActor
+    private func makeRecoveryCoordinator() -> PlaybackRecoveryCoordinator {
+        // tvOS:起播 12s。stall 监控开启(KSAVPlayer 路径由采样源内部豁免 → 返回 nil)。
+        PlaybackRecoveryFactory.make(host: self, config: .desktopTV(stallMonitoringEnabled: true), diagnostics: playbackDiagnostics)
+    }
+
+    var isLoading = false
+    var rotationAngle = 0.0
+    var hasError = false
+    var errorMessage = ""
+    var currentError: Error? = nil
+    var displayState: PlayerDisplayState = .loading  // 播放器显示状态
+    /// 画质面板点击「登录后可用」档位后，请求外层播放页弹出登录（登录协议 v1 authLimit）
+    var pendingLoginRequest: AuthenticationRecoveryRequest?
+
+    var debugTimerIsActive = false
+    var dynamicInfo: DynamicInfo?
+    var timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    
+    private var danmuConnectionTask: Task<Void, Never>?
+    var socketConnection: WebSocketConnection?
+    var httpPollingConnection: HTTPPollingDanmakuConnection?  // HTTP 轮询连接
+    var danmuCoordinator = DanmuView.Coordinator()
+    let danmuShootScheduler = DanmakuShootScheduler() // §6.2 去突发:把批量弹幕摊开逐条发射
+    private let danmakuTranslationPipeline = DanmakuTranslationPipeline()
+    private var isDanmakuTranslationSuspended = false
+    
+    var roomType: LiveRoomListType
+    var historyList: [LiveModel]?
+    
+    //Toast
+    var showToast: Bool = false
+    var toastTitle: String = ""
+    var toastTypeIsSuccess: Bool = false
+    var toastOptions = SimpleToastOptions(
+        alignment: .topLeading, hideAfter: 1.5
+    )
+    
+    var lastOptionState: PlayControlFocusableField?
+    var showTop = false
+    var onceTips = false
+    var showDanmuSettingView = false
+    var showControl = false {
+        didSet {
+            if showControl == true {
+                controlViewOptionSecond = 5  // 重置计时器
+            }
+        }
+    }
+    var showTips = false {
+        didSet {
+            if showTips == true {
+                startTipsTimer()
+                onceTips = true
+            }
+        }
+    }
+    var controlViewOptionSecond = 5 {
+        didSet {
+            if controlViewOptionSecond == 5 {
+                startTimer()
+            }
+        }
+    }
+    var tipOptionSecond = 3
+    var contolTimer: Timer? = nil
+    var tipsTimer: Timer? = nil
+    private var liveFlagTimer: Timer? = nil
+    private var liveStatusPollingSession: LiveStatusPollingSession?
+    var danmuServerIsConnected = false
+    var danmuServerIsLoading = false
+    /// 弹幕状态气泡文案;非空即显示,几秒后自动清空
+    var danmuStatusHint: String? = nil
+    /// 自动隐藏气泡的延迟任务
+    private var danmuHintHideTask: Task<Void, Never>? = nil
+    /// 是否经历过断开(用于区分"首次连上"与"重连恢复",避免正常进房弹气泡)
+    private var danmuHadDisconnected = false
+    /// 每次观看最多显示三次断开/重连提示；自动重连和手动重试不重置额度。
+    private var danmuFailureHintCount = 0
+    var supportsDanmu: Bool {
+        PlatformCapability.supports(.danmaku, for: currentRoom.liveType)
+    }
+    
+    @MainActor
+    init(currentRoom: LiveModel, appViewModel: AppState, enterFromLive: Bool, roomType: LiveRoomListType) {
+        KSOptions.isAutoPlay = true
+        KSOptions.isSecondOpen = true
+        let option = PlayerOptions()
+        option.userAgent = "libmpv"
+        option.registerRemoteControll = false
+        option.syncSystemRate = settingModel.syncSystemRate
+        self.playerOption = option
+        self.currentRoom = currentRoom
+        self.appViewModel = appViewModel
+        let list = appViewModel.favoriteViewModel.roomList
+        self.currentRoomIsLiked = list.contains { $0.roomId == currentRoom.roomId }
+        self.roomType = roomType
+        getPlayArgs()
+    }
+    
+    /**
+     切换清晰度
+    */
+    /// 用户点击被插件标记 authLimit 的档位：login_required 请求登录，其余只提示。
+    /// - Returns: true 表示已拦截，调用方不再切换。
+    @MainActor
+    private func interceptLockedQualitySelection(cdnIndex: Int, urlIndex: Int) -> Bool {
+        guard let selection = RoomPlaybackResolver.selection(
+            in: currentRoomPlayArgs,
+            cdnIndex: cdnIndex,
+            qualityIndex: urlIndex
+        ), let action = RoomPlaybackResolver.lockAction(for: selection.quality) else {
+            return false
+        }
+        switch action {
+        case .requestLogin(let message):
+            if let pluginId = SandboxPluginCatalog.platform(for: currentRoom.liveType)?.pluginId {
+                pendingLoginRequest = AuthenticationRecoveryRequest(pluginIDs: [pluginId])
+            } else {
+                showToast(false, title: message)
+            }
+        case .showMessage(let message):
+            showToast(false, title: message)
+        }
+        return true
+    }
+
+    @MainActor
+    func changePlayUrl(cdnIndex: Int, urlIndex: Int) {
+        // 恢复协调器的自动切换：同线路内跳过被锁定的档位
+        let target = currentRoomPlayArgs.map {
+            RoomPlaybackResolver.automaticSelection(
+                in: $0,
+                preferredCdnIndex: cdnIndex,
+                preferredQualityIndex: urlIndex,
+                allowsOtherCDN: false
+            )
+        } ?? (cdnIndex: cdnIndex, qualityIndex: urlIndex)
+        changePlayUrl(cdnIndex: target.cdnIndex, urlIndex: target.qualityIndex, selectionOrigin: .automatic)
+    }
+
+    @MainActor
+    func changePlayUrl(
+        cdnIndex: Int,
+        urlIndex: Int,
+        selectionOrigin: PlaybackSelectionOrigin
+    ) {
+        // 用户点击被锁定的档位：引导登录或提示，不切换
+        if selectionOrigin == .user, interceptLockedQualitySelection(cdnIndex: cdnIndex, urlIndex: urlIndex) {
+            return
+        }
+        playbackSelectionGeneration = UUID()
+        playbackDiagnostics.interruptStartup()
+        guard let playArgs = currentRoomPlayArgs, !playArgs.isEmpty,
+              cdnIndex < playArgs.count else {
+            isLoading = false
+            return
+        }
+
+        let currentCdn = playArgs[cdnIndex]
+        guard urlIndex < currentCdn.qualitys.count else { return }
+
+        let selectionOperationID: UUID?
+        if currentPlayURL != nil, currentCdnIndex != cdnIndex || currentQualityIndex != urlIndex {
+            selectionOperationID = SupportDiagnosticsService.shared.recordAction(
+                currentCdnIndex != cdnIndex ? .selectedLine : .selectedQuality,
+                context: SupportDiagnosticActionContext.selection(
+                    room: currentRoom,
+                    lineIndex: cdnIndex,
+                    lineName: currentCdn.displayName ?? currentCdn.cdn,
+                    qualityIndex: urlIndex,
+                    qualityName: currentCdn.qualitys[urlIndex].title,
+                    playerKernel: diagnosticPlayerKernel,
+                    additional: ["selection": selectionOrigin.rawValue]
+                )
+            )
+        } else {
+            selectionOperationID = nil
+        }
+
+        // 逻辑会话 = 本次进房(roomId)。同 key 时协调器内部早退,自身的 switchCDN/refresh
+        // 不会重置熔断预算;仅首次进房真正复位。
+        recoveryCoordinator.episodeChanged(streamKey: currentRoom.roomId)
+
+        let tappedSelection = RoomPlaybackResolver.selection(
+            in: playArgs,
+            cdnIndex: cdnIndex,
+            qualityIndex: urlIndex
+        )
+        let currentQuality = currentCdn.qualitys[urlIndex]
+        if RoomPlaybackResolver.requiresRefreshOnSelect(currentQuality) {
+            let debugContext = RoomPlaybackDebugContext(
+                tappedSelection: tappedSelection,
+                effectiveSelection: tappedSelection
+            )
+            currentPlayQualityString = currentQuality.title
+            currentPlayQualityQn = currentQuality.qn
+            self.currentCdnIndex = cdnIndex
+            self.currentQualityIndex = urlIndex
+
+            // 在 applyPlayURL 之前先决定播放内核，避免首次起播沿用 PlayerOptions 默认 [KSAVPlayer]
+            // 导致 FLV 流被 AVPlayer 收到后报 AVError -11850(serverIncorrectlyConfigured) 卡住。
+            let resolved = resolvePlayerTypes(quality: currentQuality, cdnIndex: cdnIndex, urlIndex: urlIndex)
+            applyResolvedPlayerTypes(resolved.playerTypes)
+            recordAutomaticPlaybackConfiguration(
+                cdn: currentCdn,
+                quality: currentQuality,
+                cdnIndex: cdnIndex,
+                qualityIndex: urlIndex
+            )
+
+            applyPlayURL(
+                quality: currentQuality,
+                cdn: currentCdn,
+                debugContext: debugContext,
+                diagnosticOperationID: selectionOperationID
+            )
+            return
+        }
+
+        let resolved = resolvePlayerTypes(quality: currentQuality, cdnIndex: cdnIndex, urlIndex: urlIndex)
+        let effectiveSelection = resolved.resolvedSelection ?? tappedSelection
+        let effectiveQuality = effectiveSelection?.quality ?? currentQuality
+        let debugContext = RoomPlaybackDebugContext(
+            tappedSelection: tappedSelection,
+            effectiveSelection: effectiveSelection
+        )
+
+        currentPlayQualityString = effectiveQuality.title
+        currentPlayQualityQn = effectiveQuality.qn
+        self.currentCdnIndex = effectiveSelection?.cdnIndex ?? cdnIndex
+        self.currentQualityIndex = effectiveSelection?.qualityIndex ?? urlIndex
+
+        applyResolvedPlayerTypes(resolved.playerTypes)
+        let effectiveCdn = effectiveSelection.map { playArgs[$0.cdnIndex] } ?? currentCdn
+        recordAutomaticPlaybackConfiguration(
+            cdn: effectiveCdn,
+            quality: effectiveQuality,
+            cdnIndex: self.currentCdnIndex,
+            qualityIndex: self.currentQualityIndex
+        )
+
+        if let resolvedURL = resolved.overrideURL {
+            setPlayURL(resolvedURL, source: "resolved", debugContext: debugContext)
+            currentPlayQualityString = resolved.overrideTitle ?? effectiveQuality.title
+            isLoading = false
+            return
+        }
+
+        applyPlayURL(
+            quality: effectiveQuality,
+            cdn: effectiveCdn,
+            debugContext: debugContext,
+            diagnosticOperationID: selectionOperationID
+        )
+    }
+
+    enum PlaybackSelectionOrigin: String {
+        case automatic
+        case user
+    }
+
+    @MainActor
+    private func recordAutomaticPlaybackConfiguration(
+        cdn: LiveQualityModel,
+        quality: LiveQualityDetail,
+        cdnIndex: Int,
+        qualityIndex: Int
+    ) {
+        guard currentPlayURL == nil, SupportDiagnosticContext.operationID != nil else { return }
+        SupportDiagnosticsService.shared.recordAction(
+            .playbackConfigured,
+            context: SupportDiagnosticActionContext.selection(
+                room: currentRoom,
+                lineIndex: cdnIndex,
+                lineName: cdn.displayName ?? cdn.cdn,
+                qualityIndex: qualityIndex,
+                qualityName: quality.title,
+                playerKernel: diagnosticPlayerKernel,
+                additional: ["selection": "automatic"]
+            )
+        )
+    }
+
+    private var diagnosticPlayerKernel: String? {
+        playerOption.playerTypes.first.map(playerTypeName(for:))
+    }
+
+    private struct PlayerTypeResult {
+        let playerTypes: [MediaPlayerProtocol.Type]
+        let overrideURL: URL?
+        let overrideTitle: String?
+        let resolvedSelection: RoomPlaybackSelection?
+    }
+
+    @MainActor
+    private func resolvePlayerTypes(quality: LiveQualityDetail, cdnIndex: Int, urlIndex: Int) -> PlayerTypeResult {
+        let applied = KSPlayerSessionConfigurator.apply(
+            quality: quality,
+            to: playerOption,
+            fallbackUserAgent: "libmpv",
+            liveReconnectPolicy: .playerManaged
+        )
+        let plan = applied.plan
+        recoveryCoordinator.playbackConfigured(isLive: plan.isLive)
+
+        return PlayerTypeResult(
+            playerTypes: applied.playerTypes,
+            overrideURL: plan.overrideURL,
+            overrideTitle: plan.overrideTitle,
+            resolvedSelection: plan.resolvedSelection
+        )
+    }
+
+    @MainActor
+    private func applyResolvedPlayerTypes(_ playerTypes: [MediaPlayerProtocol.Type]) {
+        guard let first = playerTypes.first else { return }
+        let second = playerTypes.dropFirst().first
+        applyPlayerTypes(first: first, second: second)
+    }
+
+    @MainActor
+    private func setPlayURL(
+        _ url: URL,
+        source: String,
+        debugContext: RoomPlaybackDebugContext? = nil
+    ) {
+        logSelectedStreamBeforePlayback(url, source: source, debugContext: debugContext)
+        if currentPlayURL == url {
+            currentPlayURL = nil
+            let selectionGeneration = playbackSelectionGeneration
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                guard let self, !self.playbackDiagnosticsEnded,
+                      selectionGeneration == self.playbackSelectionGeneration,
+                      self.currentPlayURL == nil else { return }
+                self.recordAssignedSource()
+                self.currentPlayURL = url
+                self.recoveryCoordinator.urlChanged(url)
+            }
+            return
+        }
+
+        recordAssignedSource()
+        currentPlayURL = url
+        // token 滚动等 URL 变化:仅更新协调器记录,不重置起播计时/熔断(修 Bug A)。
+        recoveryCoordinator.urlChanged(url)
+    }
+
+    @MainActor
+    private func logSelectedStreamBeforePlayback(
+        _ url: URL,
+        source: String,
+        debugContext: RoomPlaybackDebugContext?
+    ) {
+        let playerNames = playerOption.playerTypes.map { playerTypeName(for: $0) }
+        let selectedPlayers = playerNames.isEmpty ? "未设置" : playerNames.joined(separator: ",")
+        let tappedSummary = RoomPlaybackResolver.debugSelectionSummary(
+            in: currentRoomPlayArgs,
+            selection: debugContext?.tappedSelection
+        )
+        let effectiveSummary = RoomPlaybackResolver.debugSelectionSummary(
+            in: currentRoomPlayArgs,
+            selection: debugContext?.effectiveSelection
+        )
+        let message = "[PlayerDebug][tvOS][WillPlay] source=\(source), platform=\(currentRoom.liveType.rawValue), roomId=\(currentRoom.roomId), tapped=\(tappedSummary), effective=\(effectiveSummary), finalQuality=\(currentPlayQualityString)(qn=\(currentPlayQualityQn)), players=\(selectedPlayers), url=\(url.absoluteString)"
+        Logger.debug(message, category: .player)
+        BugsnagBootstrap.setLiveContext(platform: currentRoom.liveType.rawValue, roomID: currentRoom.roomId)
+        BugsnagBootstrap.setPlayerKernel(selectedPlayers)
+    }
+
+    private func playerTypeName(for playerType: MediaPlayerProtocol.Type) -> String {
+        let name = String(describing: playerType)
+        return name
+            .replacingOccurrences(of: "AngelLiveDependencies.", with: "")
+            .replacingOccurrences(of: "KSPlayer.", with: "")
+    }
+
+    @MainActor
+    private func applyPlayURL(
+        quality: LiveQualityDetail,
+        cdn: LiveQualityModel,
+        debugContext: RoomPlaybackDebugContext,
+        diagnosticOperationID: UUID? = nil
+    ) {
+        if let diagnosticOperationID {
+            SupportDiagnosticContext.$operationID.withValue(diagnosticOperationID) {
+                applyPlayURL(quality: quality, cdn: cdn, debugContext: debugContext)
+            }
+            return
+        }
+        if RoomPlaybackResolver.shouldRefreshPlaybackOnSelection(quality, currentPlayURL: currentPlayURL) {
+            fetchRefreshedPlayURL(
+                quality: quality,
+                cdn: cdn,
+                cdnIndex: currentCdnIndex,
+                urlIndex: currentQualityIndex,
+                debugContext: debugContext
+            )
+            return
+        }
+
+        if let url = RoomPlaybackResolver.playableURL(for: quality) {
+            setPlayURL(url, source: "direct", debugContext: debugContext)
+        }
+        isLoading = false
+    }
+
+    private func fetchRefreshedPlayURL(
+        quality: LiveQualityDetail,
+        cdn: LiveQualityModel,
+        cdnIndex: Int,
+        urlIndex: Int,
+        debugContext: RoomPlaybackDebugContext
+    ) {
+        guard let parsePlatform = SandboxPluginCatalog.platform(for: currentRoom.liveType) else {
+            isLoading = false
+            return
+        }
+        qualitySwitchTask?.cancel()
+        isLoading = true
+
+        let roomId = currentRoom.roomId
+        let selectionGeneration = playbackSelectionGeneration
+        qualitySwitchTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try Task.checkCancellation()
+                let preparedQuality = try await RoomPlaybackPreparer.prepare(
+                    roomId: roomId,
+                    cdn: cdn,
+                    quality: quality,
+                    plugin: parsePlatform
+                )
+                try Task.checkCancellation()
+                await MainActor.run {
+                    guard !Task.isCancelled, !self.playbackDiagnosticsEnded,
+                          selectionGeneration == self.playbackSelectionGeneration else { return }
+                    self.applyPreparedPlayURL(
+                        preparedQuality,
+                        cdnIndex: cdnIndex,
+                        urlIndex: urlIndex,
+                        source: "refreshPlayback",
+                        debugContext: debugContext
+                    )
+                }
+            } catch is CancellationError {
+                // 忽略取消的切换任务
+            } catch {
+                await MainActor.run {
+                    guard !Task.isCancelled, !self.playbackDiagnosticsEnded,
+                          selectionGeneration == self.playbackSelectionGeneration else { return }
+                    self.applyPreparedPlayURL(
+                        quality,
+                        cdnIndex: cdnIndex,
+                        urlIndex: urlIndex,
+                        source: "direct-fallback",
+                        debugContext: debugContext
+                    )
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func applyPreparedPlayURL(
+        _ quality: LiveQualityDetail,
+        cdnIndex: Int,
+        urlIndex: Int,
+        source: String,
+        debugContext: RoomPlaybackDebugContext
+    ) {
+        let resolved = resolvePlayerTypes(quality: quality, cdnIndex: cdnIndex, urlIndex: urlIndex)
+
+        currentPlayQualityString = resolved.overrideTitle ?? quality.title
+        currentPlayQualityQn = quality.qn
+        applyResolvedPlayerTypes(resolved.playerTypes)
+
+        if let resolvedURL = resolved.overrideURL {
+            setPlayURL(resolvedURL, source: source, debugContext: debugContext)
+        } else if let url = RoomPlaybackResolver.playableURL(for: quality) {
+            setPlayURL(url, source: source, debugContext: debugContext)
+        }
+        isLoading = false
+    }
+    
+    /// 恢复协调器是否正在自动续播(重新取参/切源)。用于静默刷新,避免全屏错误页打断。
+    @MainActor
+    private var isPlaybackRecovering: Bool {
+        if case .recovering = recoveryCoordinator.phase { return true }
+        return false
+    }
+
+    /**
+     获取播放参数。
+     
+     - Parameters:
+       - silent: 已在播时的续播重取;不全屏 loading/错误页抢 UI。
+    */
+    @MainActor
+    func getPlayArgs(silent: Bool = false, diagnosticAction: SupportDiagnosticAction = .openedRoom) {
+        guard !playbackDiagnosticsEnded else { return }
+        let requestGeneration = UUID()
+        playbackRequestGeneration = requestGeneration
+        playbackDiagnostics.fetchingSource()
+        if !silent {
+            isLoading = true
+        }
+        Task {
+            do {
+                guard let platform = SandboxPluginCatalog.platform(for: currentRoom.liveType) else {
+                    throw LiveParseError.liveParseError("不支持的平台", "\(currentRoom.liveType)")
+                }
+                let operationID = SupportDiagnosticsService.shared.recordAction(
+                    diagnosticAction,
+                    context: SupportDiagnosticActionContext.room(
+                        currentRoom,
+                        additional: ["silentRefresh": String(silent)]
+                    )
+                )
+                try await SupportDiagnosticContext.$operationID.withValue(operationID) {
+                    let playArgs = try await LiveParseJSPlatformManager.getPlayArgs(
+                        platform: platform,
+                        roomId: currentRoom.roomId,
+                        userId: currentRoom.userId
+                    )
+                    guard !Task.isCancelled, requestGeneration == playbackRequestGeneration,
+                          !playbackDiagnosticsEnded else { return }
+                    await self.updateCurrentRoomPlayArgs(playArgs)
+                }
+            } catch {
+                guard !Task.isCancelled, requestGeneration == playbackRequestGeneration,
+                      !playbackDiagnosticsEnded else { return }
+                playbackDiagnostics.sourceUnavailable()
+                await MainActor.run {
+                    isLoading = false
+                    // 恢复过程中取参失败:交给协调器继续阶梯,不立刻进错误页
+                    if silent || isPlaybackRecovering {
+                        return
+                    }
+                    // 插件明确返回 NOT_LIVE：显示已下播状态，而不是错误页
+                    if error.isNotLive {
+                        displayState = .streamerOffline
+                        return
+                    }
+                    hasError = true
+                    currentError = error
+                    errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+    
+    @MainActor func updateCurrentRoomPlayArgs(_ playArgs: [LiveQualityModel]) async {
+        guard !Task.isCancelled, !playbackDiagnosticsEnded else { return }
+        let selectionGeneration = playbackSelectionGeneration
+        let requestGeneration = playbackRequestGeneration
+        var preferredIndex = currentCdnIndex
+        if !hasSelectedInitialPlayback {
+            let pluginID = SandboxPluginCatalog.platform(for: currentRoom.liveType)?.pluginId ?? currentRoom.liveType.rawValue
+            if let learned = await CDNPreferenceStore.shared.preferredIndex(in: playArgs, pluginID: pluginID) {
+                preferredIndex = learned
+            }
+            guard !Task.isCancelled, !playbackDiagnosticsEnded,
+                  selectionGeneration == playbackSelectionGeneration,
+                  requestGeneration == playbackRequestGeneration else { return }
+            if preferredIndex != currentCdnIndex {
+                playbackDiagnostics.preferenceApplied(originalIndex: currentCdnIndex, chosenIndex: preferredIndex)
+            }
+        }
+        self.currentRoomPlayArgs = playArgs
+        if playArgs.count == 0 {
+            playbackDiagnostics.sourceUnavailable()
+            self.isLoading = false
+            if !isPlaybackRecovering {
+                showToast(false, title: "获取直播间信息失败")
+            }
+            return
+        }
+
+        // 重新取参后尽量保持当前线路/清晰度,避免无感续播跳回默认档
+        let firstLoad = currentPlayURL == nil
+        // 自动选择跳过插件标记为登录/会员才能看的档位（全部被锁时保持原逻辑）
+        let clamped = if !hasSelectedInitialPlayback && appViewModel.pluginAvailability.hasAvailablePlugins {
+            RoomPlaybackResolver.initialSelection(
+                in: playArgs,
+                preferredCdnIndex: preferredIndex,
+                preference: appViewModel.playerSettingsViewModel.defaultPlaybackQuality
+            )
+        } else {
+            RoomPlaybackResolver.automaticSelection(
+                in: playArgs,
+                preferredCdnIndex: preferredIndex,
+                preferredQualityIndex: currentQualityIndex
+            )
+        }
+        self.changePlayUrl(
+            cdnIndex: clamped.cdnIndex,
+            urlIndex: clamped.qualityIndex,
+            selectionOrigin: .automatic
+        )
+        hasSelectedInitialPlayback = true
+
+        // 开一个定时，检查主播是否已经下播(仅首次装表,避免续播重复挂 timer)
+        if firstLoad,
+           appViewModel.playerSettingsViewModel.openExitPlayerViewWhenLiveEnd == true {
+            if PlatformHostBehavior.supportsLiveEndPolling(for: currentRoom.liveType) {
+                let roomId = currentRoom.roomId
+                let userId = currentRoom.userId
+                let liveType = currentRoom.liveType
+                stopLiveStatusPolling()
+                let polling = LiveStatusPollingSession(check: {
+                    try await ApiManager.getCurrentRoomLiveState(roomId: roomId, userId: userId, liveType: liveType)
+                }, onEnded: { [weak self] in
+                    guard let self else { return }
+                    self.stopLiveStatusPolling()
+                    NotificationCenter.default.post(name: SimpleLiveNotificationNames.playerEndPlay, object: nil)
+                }, onFailure: { error in
+                    Logger.warning("检查直播状态失败:\(error)", category: .network)
+                })
+                liveStatusPollingSession = polling
+                liveFlagTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(appViewModel.playerSettingsViewModel.openExitPlayerViewWhenLiveEndSecond), repeats: true) { [weak polling] _ in
+                    // 线程前提:scheduledTimer 挂在当前(主)RunLoop,回调必在主线程,判断错误会 trap。
+                    MainActor.assumeIsolated {
+                        polling?.poll()
+                    }
+                }
+            }
+        }
+
+        // 仅首次进房拉弹幕;续播重取参数不重连弹幕
+        if firstLoad, appViewModel.danmuSettingsViewModel.showDanmu {
+            getDanmuInfo()
+        }
+    }
+    
+    @MainActor func setPlayerDelegate(playerCoordinator: KSVideoPlayer.Coordinator) {
+        self.playerCoordinator = playerCoordinator
+        // Keep the Coordinator as KSPlayerLayerDelegate so its published state,
+        // time model, and tvOS controls continue receiving every engine event.
+        playerCoordinator.onStateChanged = { [weak self] layer, state in
+            self?.player(layer: layer, state: state)
+        }
+        playerCoordinator.onFinish = { [weak self] layer, error in
+            self?.player(layer: layer, finish: error)
+        }
+        // 始终让 watchedPlayerLayer 指向当前活跃 layer,供协调器 sample provider 采样。
+        watchedPlayerLayer = playerCoordinator.playerLayer
+    }
+
+    @MainActor func togglePlayPause() {
+        if userPaused {
+            playerCoordinator?.playerLayer?.play()
+            userPaused = false
+        } else {
+            playerCoordinator?.playerLayer?.pause()
+            userPaused = true
+        }
+    }
+
+    @MainActor
+    private func applyPlayerTypes(first: MediaPlayerProtocol.Type, second: MediaPlayerProtocol.Type?) {
+        if let second {
+            playerOption.playerTypes = [first, second]
+        } else {
+            playerOption.playerTypes = [first]
+        }
+    }
+
+    
+    func getDanmuInfo() {
+        guard supportsDanmu else {
+            danmuServerIsConnected = false
+            danmuServerIsLoading = false
+            return
+        }
+        if danmuServerIsConnected == true || danmuServerIsLoading == true {
+            return
+        }
+        danmuServerIsLoading = true
+        danmuConnectionTask?.cancel()
+        let room = currentRoom
+        let roomId = room.roomId
+        let userId = currentRoom.userId
+        let liveType = currentRoom.liveType
+        danmuConnectionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let danmakuPlan: LiveParseDanmakuPlan
+                guard let platform = SandboxPluginCatalog.platform(for: liveType) else {
+                    throw NSError(
+                        domain: "danmu.platform",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "未找到平台映射：\(liveType.rawValue)"]
+                    )
+                }
+                danmakuPlan = try await LiveParseJSPlatformManager.getDanmakuPlan(
+                    platform: platform,
+                    roomId: roomId,
+                    userId: userId
+                )
+                try Task.checkCancellation()
+                guard self.currentRoom == room else { return }
+                await MainActor.run {
+                    let parameters = danmakuPlan.legacyParameters
+
+                    if danmakuPlan.prefersHTTPPolling {
+                        // 使用 HTTP 轮询连接
+                        httpPollingConnection = HTTPPollingDanmakuConnection(
+                            parameters: parameters,
+                            headers: danmakuPlan.headers,
+                            liveType: liveType,
+                            pluginId: platform.pluginId,
+                            roomId: roomId,
+                            userId: userId,
+                            danmakuPlan: danmakuPlan
+                        )
+                        httpPollingConnection?.delegate = self
+                        httpPollingConnection?.connect()
+                    } else {
+                        // 使用 WebSocket 连接
+                        socketConnection = WebSocketConnection(
+                            parameters: parameters,
+                            headers: danmakuPlan.headers,
+                            liveType: liveType,
+                            pluginId: platform.pluginId,
+                            roomId: roomId,
+                            userId: userId,
+                            danmakuPlan: danmakuPlan
+                        )
+                        socketConnection?.delegate = self
+                        socketConnection?.connect()
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, self.currentRoom == room else { return }
+                await MainActor.run {
+                    danmuServerIsLoading = false
+                }
+            }
+        }
+    }
+    
+    func disConnectSocket() {
+        danmuConnectionTask?.cancel()
+        danmuConnectionTask = nil
+        // 断开 WebSocket
+        socketConnection?.delegate = nil
+        socketConnection?.disconnect()
+        socketConnection = nil
+
+        // 断开 HTTP 轮询
+        httpPollingConnection?.delegate = nil
+        httpPollingConnection?.disconnect()
+        httpPollingConnection = nil
+
+        // §6.2 清空去突发缓冲,避免陈旧弹幕在切房/断流后继续飞出
+        danmuShootScheduler.reset()
+        danmakuTranslationPipeline.reset()
+
+        danmuServerIsConnected = false
+        danmuServerIsLoading = false
+        danmuHintHideTask?.cancel()
+        danmuHintHideTask = nil
+        danmuStatusHint = nil
+    }
+
+    @MainActor
+    func suspendDanmakuTranslationForBackground() {
+        interruptPlaybackDiagnostics()
+        isDanmakuTranslationSuspended = true
+        danmakuTranslationPipeline.reset()
+    }
+
+    @MainActor
+    func resumeDanmakuTranslationAfterBackground() {
+        playbackDiagnosticsSuspended = false
+        isDanmakuTranslationSuspended = false
+    }
+
+    @MainActor
+    func refreshPlayback() {
+        // 续播重取播放参数:不重连弹幕、尽量静默
+        let silent = currentPlayURL != nil
+        if !silent, appViewModel.danmuSettingsViewModel.showDanmu {
+            disConnectSocket()
+        }
+        getPlayArgs(silent: silent, diagnosticAction: .retriedPlayback)
+    }
+
+    func stopTimer() {
+        timer.upstream.connect().cancel()
+        debugTimerIsActive = false
+    }
+    
+    func showToast(_ success: Bool, title: String, hideAfter: TimeInterval? = 1.5) {
+        self.showToast = true
+        self.toastTitle = title
+        self.toastTypeIsSuccess = success
+        self.toastOptions = SimpleToastOptions(
+            alignment: .topLeading, hideAfter: hideAfter
+        )
+    }
+}
+
+extension RoomInfoViewModel: WebSocketConnectionDelegate {
+    func webSocketDidReceiveMessage(_ message: DanmakuDisplayMessage) {
+        let settings = appViewModel.danmuSettingsViewModel
+        let originalText = message.text
+        guard settings.showDanmu, !settings.shouldBlockDanmu(originalText) else { return }
+        if isDanmakuTranslationSuspended {
+            deliverDanmakuMessage(message)
+            return
+        }
+        danmakuTranslationPipeline.enqueue(message, onNativeTranslationFailure: { [weak self] _ in
+            guard let self, self.appViewModel.pluginAvailability.hasAvailablePlugins else { return }
+            self.showDanmuHint("原生翻译不可用，可在翻译与字幕设置中配置大模型。")
+        }) { [weak self] translatedMessage in
+            guard let self,
+                  !self.appViewModel.danmuSettingsViewModel.shouldBlockDanmu(originalText)
+            else { return }
+            self.deliverDanmakuMessage(translatedMessage)
+        }
+    }
+
+    @MainActor
+    private func deliverDanmakuMessage(_ message: DanmakuDisplayMessage) {
+        let settings = appViewModel.danmuSettingsViewModel
+        guard settings.showDanmu else { return }
+        let showColorDanmu = settings.showColorDanmu
+        let alpha = settings.danmuAlpha
+        let font = CGFloat(settings.danmuFontSize)
+        danmuShootScheduler.enqueue { [danmuCoordinator] in
+            danmuCoordinator.shoot(message, showColorDanmu: showColorDanmu, alpha: alpha, font: font)
+        }
+    }
+    
+    func webSocketDidConnect() {
+        danmuServerIsConnected = true
+        danmuServerIsLoading = false
+        // 首次连上提示"已连接",重连成功提示"已恢复"
+        showDanmuHint(danmuHadDisconnected ? "弹幕已恢复" : "弹幕已连接")
+        danmuHadDisconnected = false
+    }
+
+    func webSocketDidDisconnect(error: Error?) {
+        danmuServerIsConnected = false
+        danmuServerIsLoading = false
+        danmuHadDisconnected = true
+        if let error {
+            showDanmuHint("弹幕连接已断开:\(error.localizedDescription)", isFailure: true)
+        }
+    }
+
+    func webSocketIsReconnecting(attempt: Int, maxAttempts: Int) {
+        danmuServerIsLoading = true
+        danmuHadDisconnected = true
+        showDanmuHint(maxAttempts > 0 ? "弹幕断开,正在重连… (\(attempt)/\(maxAttempts))" : "弹幕断开，正在重连…（第 \(attempt) 次）", isFailure: true)
+    }
+
+    /// 显示左下角气泡并安排自动隐藏(默认 3 秒)。重复调用会重置计时。
+    @MainActor
+    private func showDanmuHint(_ text: String, autoHideAfter seconds: Double = 3.0, isFailure: Bool = false) {
+        if isFailure {
+            guard danmuFailureHintCount < 3 else { return }
+            danmuFailureHintCount += 1
+        }
+        danmuHintHideTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.25)) {
+            danmuStatusHint = text
+        }
+        danmuHintHideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.3)) {
+                danmuStatusHint = nil
+            }
+        }
+    }
+    
+    @MainActor
+    func stopLiveStatusPolling() {
+        liveFlagTimer?.invalidate()
+        liveFlagTimer = nil
+        liveStatusPollingSession?.stop()
+        liveStatusPollingSession = nil
+    }
+
+    @MainActor func reloadRoom(liveModel: LiveModel) {
+        _playbackDiagnostics?.end()
+        _playbackDiagnostics = nil
+        _recoveryCoordinator?.stop()
+        _recoveryCoordinator = nil
+        playbackDiagnosticsEnded = false
+        hasSelectedInitialPlayback = false
+        playbackRequestGeneration = UUID()
+        playbackSelectionGeneration = UUID()
+        stopLiveStatusPolling()
+        currentPlayURL = nil
+        disConnectSocket()
+        danmuFailureHintCount = 0
+        danmuHadDisconnected = false
+        KSOptions.isAutoPlay = true
+        KSOptions.isSecondOpen = true
+        subtitlePlayback.stop()
+        self.currentRoom = liveModel
+        getPlayArgs()
+        recoveryCoordinator.start()
+    }
+}
+
+extension RoomInfoViewModel: KSPlayerLayerDelegate {
+    
+    func player(layer: KSPlayer.KSPlayerLayer, state: KSPlayer.KSPlayerState) {
+        playbackDiagnostics.engineStateChanged(mapKSPlayerEngineState(state), isPlaying: layer.player.isPlaying)
+        isPlaying = layer.player.isPlaying
+        userPaused = !layer.player.isPlaying
+        self.dynamicInfo = layer.player.dynamicInfo
+        if state == .paused {
+            showControlView = true
+        }
+        if layer.player.isPlaying == true {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: {
+                self.showControlView = false
+            })
+        }
+        
+        let currentSelection = RoomPlaybackResolver.selection(
+            in: currentRoomPlayArgs,
+            cdnIndex: currentCdnIndex,
+            qualityIndex: currentQualityIndex
+        )
+        if let startPosition = currentSelection?.quality.playbackHints?.startPositionSeconds,
+           startPosition > 0,
+           state == .readyToPlay {
+            layer.seek(time: TimeInterval(startPosition), autoPlay: true) { _ in }
+        }
+        // 状态变化喂给协调器:起播成功/抖动/终态的判定与熔断预算全在状态机内。
+        recoveryCoordinator.stateChanged(mapKSPlayerEngineState(state))
+    }
+
+    func player(layer: KSPlayer.KSPlayerLayer, currentTime: TimeInterval, totalTime: TimeInterval) {
+
+    }
+
+    func player(layer: KSPlayer.KSPlayerLayer, finish error: Error?) {
+        // 直播 EOF 交给协调器恢复；点播正常结束不重取播放地址。
+        guard let error else {
+            if recoveryCoordinator.isLive {
+                Logger.warning("[Playback] 直播流结束，交给恢复协调器处理", category: .player)
+            } else {
+                Logger.info("[Playback] 点播正常结束", category: .player)
+            }
+            recoveryCoordinator.finished(error: nil)
+            return
+        }
+        let errorMsg = error.localizedDescription
+        // KSPlayer 内部重连最终失败后，可重试错误交给协调器做整会话阶梯重建。
+        if isRetryablePlaybackError(errorMsg) {
+            Logger.warning("========== 🔴 [EOF-RECOVER] 播放中断(可重试)→ 无感续签重取地址续播 · reason=\(errorMsg) ==========", category: .player)
+            recoveryCoordinator.finished(error: error)
+            return
+        }
+        Logger.error("[KSPlayer] non-retryable playback error on tvOS: \(errorMsg)", category: .player)
+        checkLiveStatusOnError(error: error)
+    }
+
+    // MARK: - 受控播放重建
+
+    private func isRetryablePlaybackError(_ message: String) -> Bool {
+        message.contains("avformat can't open input")
+            || message.contains("timed out")
+            || message.contains("Operation timed out")
+            || message.contains("End of file")
+            || message.contains("readFrame")
+            || message.contains("I/O error")
+    }
+
+    /// 播放器错误时检查直播状态
+    @MainActor
+    func checkLiveStatusOnError(error: Error) {
+        // 恢复阶梯未结束时不进错误页,避免无感续播被打断
+        if isPlaybackRecovering { return }
+        Task {
+            do {
+                let state = try await ApiManager.getCurrentRoomLiveState(
+                    roomId: currentRoom.roomId,
+                    userId: currentRoom.userId,
+                    liveType: currentRoom.liveType
+                )
+                if state == .close || state == .unknow {
+                    // 主播已下播
+                    displayState = .streamerOffline
+                } else {
+                    // 仍在直播但连接失败，显示错误
+                    hasError = true
+                    currentError = error
+                    errorMessage = error.localizedDescription
+                    displayState = .error
+                }
+            } catch let statusError where statusError.isNotLive {
+                // 插件明确返回 NOT_LIVE，按已下播处理
+                displayState = .streamerOffline
+            } catch {
+                // 检查状态失败，显示原始错误
+                hasError = true
+                currentError = error
+                errorMessage = error.localizedDescription
+                displayState = .error
+            }
+        }
+    }
+
+    /// 选择下一条可用 CDN。仅有 1 条时返回 nil,让上层走 refresh 分支。
+    func nextCdnIndex() -> Int? {
+        guard let args = currentRoomPlayArgs, args.count > 1 else { return nil }
+        return (currentCdnIndex + 1) % args.count
+    }
+
+    func player(layer: KSPlayer.KSPlayerLayer, bufferedCount: Int, consumeTime: TimeInterval) {
+
+    }
+    
+    //控制层timer和顶部提示timer
+    func startTimer() {
+        contolTimer?.invalidate() // 停止之前的计时器
+        contolTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            // 线程前提:scheduledTimer 挂在当前(主)RunLoop,回调必在主线程,判断错误会 trap。
+            MainActor.assumeIsolated {
+                if self.controlViewOptionSecond > 0 {
+                    self.controlViewOptionSecond -= 1
+                } else {
+                    self.showControl = false
+                    if self.onceTips == false {
+                        self.showTips = true
+                    }
+                    self.contolTimer?.invalidate() // 计时器停止
+                }
+            }
+        }
+    }
+    
+    func startTipsTimer() {
+        if onceTips {
+            return
+        }
+        tipsTimer?.invalidate() // 停止之前的计时器
+        tipOptionSecond = 3 // 重置计时器
+
+        tipsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            // 线程前提:scheduledTimer 挂在当前(主)RunLoop,回调必在主线程,判断错误会 trap。
+            MainActor.assumeIsolated {
+                if self.tipOptionSecond > 0 {
+                    self.tipOptionSecond -= 1
+                } else {
+                    self.showTips = false
+                    self.tipsTimer?.invalidate() // 计时器停止
+                }
+            }
+        }
+    }
+
+}
+
+// MARK: - PlaybackRecoveryHost
+extension RoomInfoViewModel: PlaybackRecoveryHost {}

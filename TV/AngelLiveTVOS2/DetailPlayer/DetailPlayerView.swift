@@ -1,0 +1,374 @@
+//
+//  DetailPlayerView.swift
+//  SimpleLiveTVOS
+//
+//  Created by pc on 2023/12/12.
+//
+
+import SwiftUI
+import SharedAssets
+import AVKit
+import AngelLiveDependencies
+import Combine
+import AngelLiveCore
+
+
+struct DetailPlayerView: View {
+
+    @StateObject private var playerCoordinator = KSVideoPlayer.Coordinator()
+    @State private var didCleanup = false
+    @State private var authenticationRecovery: AuthenticationRecoveryRequest?
+    /// 标记 KSPlayer 是否曾进入实际渲染态(.buffering / .bufferFinished)。
+    /// 直播流 state 在 KSPlayer 内可能长期停留在 .buffering(被视作 isPlaying),
+    /// 不能再把 .buffering 当作"加载中"来盖 overlay,否则永不消失。
+    @State private var visibleRecoveryNotice: PlaybackRecoveryNotice?
+    @Environment(RoomInfoViewModel.self) var roomInfoViewModel
+    @Environment(AppState.self) var appViewModel
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
+    public var didExitView: (Bool, String) -> Void = {_, _ in}
+    
+    var body: some View {
+        playerContent
+            .fullScreenCover(item: $authenticationRecovery) { request in
+                AccountManagementView(recoveryPluginIDs: request.pluginIDs)
+                    .frame(maxWidth: 1000)
+                    .padding(80)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.ultraThinMaterial)
+            }
+            .overlay(alignment: .top) {
+                if let notice = visibleRecoveryNotice {
+                    TVPlayerRecoveryNoticeBanner(notice: notice)
+                        .padding(.top, 48)
+                        .padding(.horizontal, 80)
+                        .transition(accessibilityReduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                switch phase {
+                case .active:
+                    roomInfoViewModel.resumeDanmakuTranslationAfterBackground()
+                case .background:
+                    roomInfoViewModel.suspendDanmakuTranslationForBackground()
+                case .inactive:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+            .onChange(of: roomInfoViewModel.recoveryNotice) { _, notice in
+                showRecoveryNotice(notice)
+            }
+            // 画质面板点击「登录后可用」档位：复用登录恢复页
+            .onChange(of: roomInfoViewModel.pendingLoginRequest?.id) { _, _ in
+                guard let request = roomInfoViewModel.pendingLoginRequest else { return }
+                roomInfoViewModel.pendingLoginRequest = nil
+                authenticationRecovery = request
+            }
+            // 当前平台登录状态变化后重新取流，让被锁定的画质解锁
+            .onReceive(
+                NotificationCenter.default.publisher(for: .platformSessionMetadataDidChange)
+                    .compactMap { $0.object as? String }
+                    .receive(on: RunLoop.main)
+            ) { pluginId in
+                guard pluginId == SandboxPluginCatalog.platform(for: roomInfoViewModel.currentRoom.liveType)?.pluginId else { return }
+                // 与错误页「重试」一致：先清掉错误态再重新取流
+                if roomInfoViewModel.hasError {
+                    roomInfoViewModel.hasError = false
+                    roomInfoViewModel.currentError = nil
+                }
+                roomInfoViewModel.refreshPlayback()
+            }
+            .onDisappear {
+                // Presenting account recovery keeps this room alive for a manual retry.
+                guard authenticationRecovery == nil else { return }
+                cleanupPlayer()
+            }
+    }
+
+    @ViewBuilder
+    private var playerContent: some View {
+        if roomInfoViewModel.displayState == .streamerOffline {
+            // 主播已下播页面
+            VStack(spacing: 30) {
+                Image(systemName: "tv.slash")
+                    .font(.system(size: 80))
+                    .foregroundColor(.gray)
+                Text("主播已下播")
+                    .font(.title)
+                    .foregroundColor(.white)
+                Text(roomInfoViewModel.currentRoom.userName.orDash)
+                    .font(.headline)
+                    .foregroundColor(.gray)
+                Button("返回") {
+                    endPlay()
+                }
+                .padding(.top, 20)
+            }
+            .frame(width: 1920, height: 1080)
+            .background(.black)
+        } else if roomInfoViewModel.hasError, let error = roomInfoViewModel.currentError {
+            ErrorView(
+                title: error.isAuthRequired ? "播放失败-请登录\(LiveParseTools.getLivePlatformName(roomInfoViewModel.currentRoom.liveType))账号" : "播放失败",
+                message: error.liveParseMessage,
+                detailMessage: error.liveParseDetail,
+                curlCommand: error.liveParseCurl,
+                showRetry: true,
+                showLoginButton: error.showsLoginAction,
+                onDismiss: {
+                    endPlay()
+                },
+                onRetry: {
+                    roomInfoViewModel.hasError = false
+                    roomInfoViewModel.currentError = nil
+                    if error.showsLoginAction || roomInfoViewModel.currentPlayURL == nil {
+                        roomInfoViewModel.getPlayArgs(diagnosticAction: .retriedPlayback)
+                    } else {
+                        playerCoordinator.playerLayer?.play()
+                    }
+                },
+                onLogin: {
+                    let pluginIDs = SandboxPluginCatalog.platform(for: roomInfoViewModel.currentRoom.liveType).map { [$0.pluginId] } ?? []
+                    authenticationRecovery = AuthenticationRecoveryRequest(pluginIDs: pluginIDs)
+                }
+            )
+        } else if roomInfoViewModel.currentPlayURL == nil {
+            ZStack {
+                KFImage(URL(string: roomInfoViewModel.currentRoom.roomCover))
+                    .placeholder {
+                        ZStack {
+                            Color.black
+                            Image("placeholder")
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .opacity(0.5)
+                        }
+                    }
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 1920, height: 1080)
+                    .clipped()
+                    .blur(radius: 24)
+                    .overlay {
+                        Color.black.opacity(0.5)
+                    }
+
+                TVStreamLoadingOverlay(dynamicInfo: nil, stage: roomInfoViewModel.startupStage)
+            }
+            .frame(width: 1920, height: 1080)
+            .background(.black)
+        }else {
+            ZStack {
+                KSVideoPlayer(coordinator: playerCoordinator, url: roomInfoViewModel.currentPlayURL ?? URL(string: "")!, options: roomInfoViewModel.playerOption)
+                    .background(Color.black)
+                    .onAppear {
+                        playerCoordinator.playerLayer?.play()
+                        roomInfoViewModel.setPlayerDelegate(playerCoordinator: playerCoordinator)
+                        // 启动统一恢复协调器的 1Hz 采样;起播超时/stall/finish 全由它接管。
+                        roomInfoViewModel.recoveryCoordinator.start()
+                    }
+                    .onChange(of: roomInfoViewModel.currentPlayURL) { _, _ in
+                        // URL 变化(refresh / CDN failover)时 KSPlayer 可能重建 playerLayer，
+                        // 重新绑定业务回调与采样 layer，保持三端一致。
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            roomInfoViewModel.setPlayerDelegate(playerCoordinator: playerCoordinator)
+                        }
+                    }
+                    .safeAreaPadding(.all)
+                    .zIndex(1)
+
+                // 加载/缓冲指示器 - URL 已就绪但尚未开始播放，或播放中缓冲时显示
+                if shouldShowStreamLoading {
+                    TVStreamLoadingOverlay(
+                        dynamicInfo: playerCoordinator.playerLayer?.player.dynamicInfo,
+                        stage: roomInfoViewModel.startupStage
+                    )
+                    .zIndex(4)
+                }
+
+                PlayerControlView(playerCoordinator: playerCoordinator)
+                    .zIndex(3)
+                    .frame(width: 1920, height: 1080)
+//                    .opacity(roomInfoViewModel.showControlView ? 1 : 0)
+                    .safeAreaPadding(.all)
+                    .environment(roomInfoViewModel)
+                    .environment(appViewModel)
+                if roomInfoViewModel.supportsDanmu {
+                    VStack {
+                        if appViewModel.danmuSettingsViewModel.danmuAreaIndex >= 3 {
+                            Spacer()
+                        }
+                        DanmuView(coordinator: roomInfoViewModel.danmuCoordinator, height: appViewModel.danmuSettingsViewModel.getDanmuArea().0)
+                            .frame(width: 1920, height: appViewModel.danmuSettingsViewModel.getDanmuArea().0)
+                            .opacity(appViewModel.danmuSettingsViewModel.showDanmu ? 1 : 0)
+                            .environment(appViewModel)
+                        if appViewModel.danmuSettingsViewModel.danmuAreaIndex < 3 {
+                            Spacer()
+                        }
+                    }
+                    .zIndex(2)
+                }
+
+                #if canImport(KSPlayer)
+                if appViewModel.pluginAvailability.hasAvailablePlugins, let url = roomInfoViewModel.currentPlayURL {
+                    Color.clear
+                        .allowsHitTesting(false)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .liveSubtitleOverlay(
+                            coordinator: playerCoordinator,
+                            playback: roomInfoViewModel.subtitlePlayback,
+                            playbackIdentity: url.absoluteString,
+                            bottomPadding: 64
+                        )
+                        .zIndex(2.5)
+                }
+                #endif
+            }
+            .onReceive(NotificationCenter.default.publisher(for: SimpleLiveNotificationNames.playerEndPlay)) { _ in
+                endPlay()
+            }
+            .onPlayPauseCommand {
+                roomInfoViewModel.togglePlayPause()
+            }
+            // Coordinator remains the sole layer delegate; the VM receives its forwarded callbacks.
+            // Keep first playback sticky so a later pause or rebuffer does not look like startup.
+            .frame(width: 1920, height: 1080)
+        }
+    }
+
+    @MainActor func endPlay() {
+        cleanupPlayer()
+        didExitView(false, "")
+    }
+
+    @MainActor
+    private func showRecoveryNotice(_ notice: PlaybackRecoveryNotice?) {
+        withAnimation(accessibilityReduceMotion ? nil : .easeInOut(duration: 0.2)) {
+            visibleRecoveryNotice = notice
+        }
+        guard let notice else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard visibleRecoveryNotice?.id == notice.id else { return }
+            withAnimation(accessibilityReduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                visibleRecoveryNotice = nil
+            }
+        }
+    }
+
+    @MainActor
+    private func cleanupPlayer() {
+        guard !didCleanup else { return }
+        didCleanup = true
+        roomInfoViewModel.subtitlePlayback.stop()
+        roomInfoViewModel.endPlaybackDiagnostics()
+        SupportDiagnosticsService.shared.recordAction(
+            .closedRoom,
+            context: SupportDiagnosticActionContext.room(roomInfoViewModel.currentRoom)
+        )
+        roomInfoViewModel.recoveryCoordinator.stop()
+        playerCoordinator.resetPlayer()
+        roomInfoViewModel.disConnectSocket()
+    }
+
+    /// 是否应展示加载层（缓冲或初次加载）。
+    private var shouldShowStreamLoading: Bool {
+        // 起播一次之后,只在用户主动 seek 时再现 overlay。直播流不会 seek,通常等于永不再现。
+        if roomInfoViewModel.hasObservedPlaybackProgress {
+            return playerCoordinator.playerLayer?.player.playbackState == .seeking
+        }
+        return isInitialStreamLoading
+    }
+
+    /// 流首次加载（URL 已就绪但未开始播放）。
+    /// 注意：.readyToPlay 是「准备好可以播」而非「已在播」，KSPlayer 此时尚未渲染帧。
+    /// 不能用 isPlaying 二次过滤，否则 .readyToPlay 与 .buffering 之间会闪一帧黑。
+    private var isInitialStreamLoading: Bool {
+        switch playerCoordinator.state {
+        case .paused, .playedToTheEnd, .error:
+            return false
+        default:
+            return true
+        }
+    }
+}
+
+// MARK: - 直播加载指示
+
+/// tvOS 直播流加载层:细圆弧 + 数字/单位分体网速,无背景片,贴在视频画面上。
+/// 网速订阅 KSPlayer 自带的 `DynamicInfo.networkSpeed`(@Published)。
+struct TVStreamLoadingOverlay: View {
+    let dynamicInfo: DynamicInfo?
+    let stage: PlaybackStartupStage
+
+    var body: some View {
+        VStack(spacing: 24) {
+            ArcSpinner(size: 64, lineWidth: 2.5)
+                .tint(.white)
+            VStack(spacing: 10) {
+                Text(stage.title)
+                    .font(.title3.weight(.medium))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                if let info = dynamicInfo {
+                    TVStreamSpeedText(info: info)
+                }
+            }
+        }
+        .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(stage.title)
+    }
+}
+
+private struct TVStreamSpeedText: View {
+    @ObservedObject var info: DynamicInfo
+
+    var body: some View {
+        if info.networkSpeed > 0 {
+            let (value, unit) = SpeedFormatter.split(bytesPerSecond: Int64(info.networkSpeed))
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(value)
+                    .font(.system(size: 44, weight: .ultraLight, design: .rounded))
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
+                Text(unit)
+                    .font(.system(size: 18, weight: .medium))
+                    .tracking(1)
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+        }
+    }
+}
+
+private struct TVPlayerRecoveryNoticeBanner: View {
+    let notice: PlaybackRecoveryNotice
+
+    var body: some View {
+        Text(notice.title)
+            .font(.title3.weight(.medium))
+            .foregroundStyle(.white)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
+            .frame(maxWidth: 800)
+            .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .allowsHitTesting(false)
+            .accessibilityLabel(notice.title)
+    }
+}
+
+// MARK: - 共享组件
+
+/// 网速格式化:返回 (数字, 单位) 拆分。
+private enum SpeedFormatter {
+    static func split(bytesPerSecond: Int64) -> (value: String, unit: String) {
+        let bps = max(bytesPerSecond, 0)
+        let kb = Double(bps) / 1024.0
+        if kb < 1024 {
+            return (String(format: "%.0f", kb), "KB/s")
+        }
+        return (String(format: "%.1f", kb / 1024.0), "MB/s")
+    }
+}

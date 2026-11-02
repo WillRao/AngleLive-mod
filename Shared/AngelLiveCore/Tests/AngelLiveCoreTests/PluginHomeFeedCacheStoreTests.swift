@@ -1,0 +1,200 @@
+import Foundation
+import Testing
+@testable import AngelLiveCore
+
+struct PluginHomeFeedCacheStoreTests {
+    @Test("expired home snapshot appears before catalog readiness and is removed only after confirmed absence")
+    @MainActor
+    func cachePrecedesPlatformReadiness() async throws {
+        let directoryURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let store = PluginHomeFeedCacheStore(fileURL: directoryURL.appendingPathComponent("home-feed.json"))
+        let feed = PluginHomeFeed(
+            pluginId: "fixture.plugin", pluginDisplayName: "Fixture",
+            schemaVersion: PluginHomeFeedRequest.supportedSchemaVersion, revision: "cached",
+            generatedAt: Date(timeIntervalSince1970: 1), ttlSeconds: 60,
+            banners: [PluginHomeBanner(
+                id: "cached-banner", imageURL: try #require(URL(string: "https://example.invalid/banner.jpg")),
+                title: "Cached banner", subtitle: nil, badge: nil,
+                target: .category(.init(id: "category", parentId: "", title: "Category", icon: "", biz: nil))
+            )],
+            sections: [], diagnostics: .init(droppedBanners: 0, droppedSections: 0, droppedItems: 0)
+        )
+        #expect(await store.save([feed]))
+        let model = PluginHomeFeedModel(cacheStore: store)
+
+        await model.refresh(installedPluginIds: [], availabilityConfirmed: false)
+        #expect(model.bannerEntries.map(\.banner.title) == ["Cached banner"])
+        #expect(model.hasRestoredCache)
+        #expect(!model.hasLoaded)
+        #expect(await store.load().count == 1)
+
+        await model.refresh(installedPluginIds: [], availabilityConfirmed: true)
+        #expect(model.bannerEntries.isEmpty)
+        #expect(model.hasLoaded)
+        #expect(await store.load().isEmpty)
+    }
+
+    @Test("home feed cache round-trips validated content")
+    func roundTrip() async throws {
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let imageURL = try #require(URL(string: "https://example.invalid/banner.jpg"))
+        let room = LiveModel(
+            userName: "Streamer",
+            roomTitle: "Cached room",
+            roomCover: "https://example.invalid/cover.jpg",
+            userHeadImg: "https://example.invalid/avatar.jpg",
+            liveType: "fixture",
+            liveState: LiveState.live.rawValue,
+            userId: "user-1",
+            roomId: "room-1",
+            liveWatchedCount: "100"
+        )
+        let category = LiveCategoryModel(
+            id: "category-1",
+            parentId: "",
+            title: "Popular",
+            icon: "",
+            biz: nil
+        )
+        let feed = PluginHomeFeed(
+            pluginId: "fixture.plugin",
+            pluginDisplayName: "Fixture",
+            schemaVersion: PluginHomeFeedRequest.supportedSchemaVersion,
+            revision: "revision-1",
+            generatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            ttlSeconds: 900,
+            banners: [
+                PluginHomeBanner(
+                    id: "fixture.plugin:banner:1",
+                    imageURL: imageURL,
+                    title: "Cached banner",
+                    subtitle: "Available immediately",
+                    badge: "LIVE",
+                    target: .room(room)
+                )
+            ],
+            sections: [
+                PluginHomeSection(
+                    id: "fixture.plugin:section:popular",
+                    title: "Popular",
+                    subtitle: nil,
+                    personalized: false,
+                    items: [
+                        PluginHomeRoomItem(
+                            id: "fixture.plugin:section:popular:item:1",
+                            room: room,
+                            reason: "Cached"
+                        )
+                    ],
+                    seeAllTarget: category
+                )
+            ],
+            diagnostics: PluginHomeFeedDiagnostics(
+                droppedBanners: 0,
+                droppedSections: 0,
+                droppedItems: 0
+            )
+        )
+
+        let store = PluginHomeFeedCacheStore(
+            fileURL: directoryURL.appendingPathComponent("home-feed.json")
+        )
+        #expect(await store.save([feed]))
+
+        let restoredFeeds = await store.load()
+        let restored = try #require(restoredFeeds.first)
+        #expect(restored.pluginId == feed.pluginId)
+        #expect(restored.revision == feed.revision)
+        #expect(restored.banners.first?.imageURL == imageURL)
+        #expect(restored.sections.first?.items.first?.room == room)
+        let restoredCategory = try #require(restored.sections.first?.seeAllTarget)
+        #expect(restoredCategory.id == category.id)
+        #expect(restoredCategory.parentId == category.parentId)
+        #expect(restoredCategory.title == category.title)
+
+        guard case .room(let restoredRoom) = try #require(restored.banners.first?.target) else {
+            Issue.record("Expected cached room banner target")
+            return
+        }
+        #expect(restoredRoom == room)
+    }
+
+    @Test("corrupted home feed cache is ignored")
+    func corruptedCache() async throws {
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let fileURL = directoryURL.appendingPathComponent("home-feed.json")
+        try Data("not-json".utf8).write(to: fileURL, options: [.atomic])
+
+        let store = PluginHomeFeedCacheStore(fileURL: fileURL)
+        #expect(await store.load().isEmpty)
+    }
+
+    @Test("cache persists fetch time and per-plugin context revision")
+    func metadataRoundTrip() async throws {
+        let directoryURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let store = PluginHomeFeedCacheStore(fileURL: directoryURL.appendingPathComponent("home-feed.json"))
+        let feed = makeFeed(pluginId: "fixture.plugin", revision: "content")
+        let fetchedAt = Date(timeIntervalSince1970: 1_700_000_000)
+
+        #expect(await store.save(
+            [feed],
+            contextRevisions: [feed.pluginId: "session-2"],
+            fetchedAtByPluginId: [feed.pluginId: fetchedAt]
+        ))
+        let entry = try #require(await store.loadSnapshot()?.entries.first)
+        #expect(entry.fetchedAt == fetchedAt)
+        #expect(entry.contextRevision == "session-2")
+    }
+
+    @Test("legacy cache loads but is marked stale")
+    func legacyCacheIsStale() async throws {
+        let directoryURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let fileURL = directoryURL.appendingPathComponent("home-feed.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let data = try encoder.encode(LegacyFixture(
+            schemaVersion: 1,
+            savedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            feeds: [makeFeed(pluginId: "fixture.plugin", revision: "legacy")]
+        ))
+        try data.write(to: fileURL)
+
+        let entry = try #require(await PluginHomeFeedCacheStore(fileURL: fileURL).loadSnapshot()?.entries.first)
+        #expect(entry.fetchedAt == .distantPast)
+        #expect(entry.contextRevision == nil)
+    }
+}
+
+private struct LegacyFixture: Codable {
+    let schemaVersion: Int
+    let savedAt: Date
+    let feeds: [PluginHomeFeed]
+}
+
+private func makeFeed(pluginId: String, revision: String) -> PluginHomeFeed {
+    PluginHomeFeed(
+        pluginId: pluginId,
+        pluginDisplayName: pluginId,
+        schemaVersion: PluginHomeFeedRequest.supportedSchemaVersion,
+        revision: revision,
+        generatedAt: nil,
+        ttlSeconds: 60,
+        banners: [],
+        sections: [],
+        diagnostics: .init(droppedBanners: 0, droppedSections: 0, droppedItems: 0)
+    )
+}

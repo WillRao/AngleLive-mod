@@ -1,0 +1,867 @@
+//
+//  DetailPlayerView.swift
+//  AngelLive
+//
+//  Created by pangchong on 10/21/25.
+//
+
+import SwiftUI
+import AngelLiveCore
+import AngelLiveDependencies
+import Combine
+
+/// FullUI routes explicitly declared episodic content to its own player surface.
+struct DetailPlayerView: View {
+    let viewModel: RoomInfoViewModel
+    let categoryRooms: [LiveModel]
+    let canLoadMoreCategoryRooms: () -> Bool
+    let onLoadMoreCategoryRooms: (() async -> [LiveModel])?
+
+    init(
+        viewModel: RoomInfoViewModel,
+        categoryRooms: [LiveModel] = [],
+        canLoadMoreCategoryRooms: @escaping () -> Bool = { false },
+        onLoadMoreCategoryRooms: (() async -> [LiveModel])? = nil
+    ) {
+        self.viewModel = viewModel
+        self.categoryRooms = categoryRooms
+        self.canLoadMoreCategoryRooms = canLoadMoreCategoryRooms
+        self.onLoadMoreCategoryRooms = onLoadMoreCategoryRooms
+    }
+
+    var body: some View {
+        Group {
+            if ShortDramaRouting.isShortDrama(viewModel.currentRoom) {
+                ShortDramaPlayerView(room: viewModel.currentRoom)
+                    .id(viewModel.currentRoom.id)
+            } else {
+                LiveDetailPlayerView(
+                    viewModel: viewModel,
+                    categoryRooms: categoryRooms,
+                    canLoadMoreCategoryRooms: canLoadMoreCategoryRooms,
+                    onLoadMoreCategoryRooms: onLoadMoreCategoryRooms
+                )
+            }
+        }
+        .fullUIWindowContext()
+    }
+}
+
+struct LiveDetailPlayerView: View {
+    @State var viewModel: RoomInfoViewModel
+    let categoryRooms: [LiveModel]
+    let canLoadMoreCategoryRooms: () -> Bool
+    let onLoadMoreCategoryRooms: (() async -> [LiveModel])?
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.fullUIWindowContext) private var windowContext
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(HistoryModel.self) private var historyModel
+    @Environment(AppFavoriteModel.self) private var favoriteModel
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
+
+    /// 全局播放器 coordinator，在整个 DetailPlayerView 生命周期中保持
+    @StateObject private var playerCoordinator = KSVideoPlayer.Coordinator()
+    /// 稳定的播放器模型，避免随视图重建
+    @StateObject private var playerModel = KSVideoPlayerModel(title: "", config: KSVideoPlayer.Coordinator(), options: KSOptions(), url: nil)
+    @StateObject private var playbackSession = KSPlayerPlaybackSession(
+        role: .primary,
+        supportedGlobalCapabilities: [.audioFocus, .nowPlaying, .pictureInPicture, .remoteCommands]
+    )
+
+    /// Fullscreen intent is independent of whether the scene accepts a rotation request.
+    @State private var isIPadFullscreen: Bool = false
+
+    /// 播放画面与信息区共用已确认的媒体比例，避免独立高度反馈滞后。
+    @State private var videoAspectRatio: CGFloat = 16.0 / 9.0
+
+    /// 是否为竖屏直播模式
+    @State private var isVerticalLiveMode: Bool = false
+    /// 用户主动控制竖屏清屏状态，不随播放器的自动隐藏或播放状态改变。
+    @State private var verticalLiveControlsVisible = true
+    @State private var verticalLiveControlPopupPresented = false
+
+    /// Only a vertically compact phone layout needs to hide the information panel.
+    private var isIPhoneLandscape: Bool {
+        verticalSizeClass == .compact
+    }
+
+    private var usesExpandedLayout: Bool {
+        horizontalSizeClass == .regular && verticalSizeClass == .regular
+    }
+
+    private var isFullscreen: Bool {
+        isIPhoneLandscape || isIPadFullscreen
+    }
+
+    /// iPad windows use an in-place action even when narrow; phone rotation
+    /// remains available outside the expanded layout.
+    private var usesInPlaceFullscreen: Bool {
+        usesExpandedLayout || windowContext?.window?.traitCollection.userInterfaceIdiom == .pad
+    }
+
+    /// Orientation policy remains phone-specific; layout does not depend on idiom.
+    private var usesPhoneOrientationPolicy: Bool {
+        windowContext?.window?.traitCollection.userInterfaceIdiom == .phone
+    }
+
+    /// 进入后台前是否处于 iPhone 横屏全屏（用于回前台时保留用户主动触发的横屏）
+    @State private var wasLandscapeBeforeBackground: Bool = false
+
+    /// 用户离开底部时显示“查看最新评论”按钮
+    @State private var showJumpToLatest: Bool = false
+    /// 触发跳到底部的请求
+    @State private var scrollToBottomRequest: Bool = false
+
+    @State private var isRoomSwitcherPresented = false
+    @State private var selectedRoomSourceIndex: Int
+    @State private var switchingRoomID: String?
+    @State private var failedRoomID: String?
+    @State private var roomSwitchFailureMessage: String?
+    @State private var roomSwitchTask: Task<Void, Never>?
+    @State private var switcherCategoryRooms: [LiveModel]
+    @State private var isLoadingMoreCategoryRooms = false
+    @State private var authenticationRecoveryRequest: AuthenticationRecoveryRequest?
+    @Environment(\.presentToast) private var presentToast
+
+    init(
+        viewModel: RoomInfoViewModel,
+        categoryRooms: [LiveModel] = [],
+        canLoadMoreCategoryRooms: @escaping () -> Bool = { false },
+        onLoadMoreCategoryRooms: (() async -> [LiveModel])? = nil
+    ) {
+        _viewModel = State(initialValue: viewModel)
+        self.categoryRooms = categoryRooms
+        self.canLoadMoreCategoryRooms = canLoadMoreCategoryRooms
+        self.onLoadMoreCategoryRooms = onLoadMoreCategoryRooms
+        let hasCategoryRooms = categoryRooms.contains(viewModel.currentRoom)
+            && categoryRooms.contains { $0 != viewModel.currentRoom }
+        _selectedRoomSourceIndex = State(initialValue: hasCategoryRooms ? 2 : 0)
+        _switcherCategoryRooms = State(initialValue: categoryRooms)
+    }
+
+    private var currentPlaybackError: Error? {
+        viewModel.playError
+    }
+
+    private var playbackErrorTitle: String {
+        if currentPlaybackError?.isAuthRequired == true {
+            let platformName = LiveParseTools.getLivePlatformName(viewModel.currentRoom.liveType)
+            return "播放失败-请登录\(platformName)账号"
+        }
+        return "播放失败"
+    }
+
+    private var playbackErrorMessage: String {
+        if let error = currentPlaybackError {
+            return error.liveParseMessage
+        }
+        return viewModel.playErrorMessage ?? "播放失败"
+    }
+
+    private var shouldShowPlatformLoginPrompt: Bool {
+        currentPlaybackError?.showsLoginAction == true
+    }
+
+    private var currentPluginID: String? {
+        SandboxPluginCatalog.platform(for: viewModel.currentRoom.liveType)?.pluginId
+    }
+
+    private var shouldHideSystemBackButton: Bool {
+        true
+    }
+
+    private var shouldEnableInteractivePopGesture: Bool {
+        if #available(iOS 18.0, *) {
+            return false
+        }
+        return !isFullscreen && allowsEdgeDismiss
+    }
+
+    private var allowsEdgeDismiss: Bool {
+        !isVerticalLiveMode || verticalLiveControlsVisible
+    }
+
+    private var legacyPlayerGestureMask: GestureMask {
+        #if canImport(KSPlayer)
+        if #available(iOS 18.0, *) {
+            return .subviews
+        }
+        #endif
+        return .all
+    }
+
+    // MARK: - Body
+
+    var body: some View {
+        GeometryReader { geometry in
+            let isLandscape = geometry.size.width > geometry.size.height
+            let iPhoneLandscapeMode = isIPhoneLandscape
+            // 竖屏直播模式下隐藏信息面板，让播放器占满全屏
+            let showInfoPanel = !isVerticalLiveMode && !isFullscreen
+            // Reuse the 400pt information panel only with at least a compact
+            // 320pt playback surface beside it; regular traits alone are not a width guarantee.
+            let showsSidePanel = showInfoPanel && usesExpandedLayout && isLandscape
+                && geometry.size.width >= 720
+
+            // 计算播放器宽度
+            let playerWidth: CGFloat = {
+                let baseWidth = geometry.size.width
+                if isVerticalLiveMode {
+                    return baseWidth // 竖屏直播占满宽度
+                } else if showsSidePanel {
+                    return baseWidth - 400 // iPad 横屏减去右侧信息栏
+                } else {
+                    return baseWidth
+                }
+            }()
+
+            // 扩展布局保留既有高度规则；紧凑布局随真实媒体比例调整。
+            let playerHeight: CGFloat = {
+                if isVerticalLiveMode || isFullscreen {
+                    return geometry.size.height // 竖屏直播占满高度
+                } else if usesExpandedLayout {
+                    // iPad 保持原逻辑
+                    if showInfoPanel {
+                        if showsSidePanel {
+                            return geometry.size.height // 展开侧栏时占满可用高度
+                        } else {
+                            return playerWidth / 16 * 9 // iPad 竖屏保持 16:9
+                        }
+                    } else {
+                        return geometry.size.height // 全屏模式占满高度
+                    }
+                } else {
+                    return playerWidth / videoAspectRatio
+                }
+            }()
+
+            ZStack(alignment: .topLeading) {
+                // 模糊背景
+                backgroundView
+
+                // 主播已下播视图
+                if viewModel.displayState == .streamerOffline {
+                    VStack(spacing: 20) {
+                        Image(systemName: "tv.slash")
+                            .font(.system(size: 60))
+                            .foregroundColor(.gray)
+                        Text("主播已下播")
+                            .font(.title2)
+                            .foregroundColor(.white)
+                        Text(viewModel.currentRoom.userName)
+                            .font(.subheadline)
+                            .foregroundColor(.gray)
+                        Button("返回") {
+                            dismiss()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .padding(.top, 10)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .zIndex(100)
+                }
+                // 错误视图 - 当播放出错时显示
+                else if viewModel.playError != nil || viewModel.playErrorMessage != nil {
+                    ErrorView(
+                        title: playbackErrorTitle,
+                        message: playbackErrorMessage,
+                        errorCode: nil,
+                        detailMessage: currentPlaybackError?.liveParseDetail,
+                        curlCommand: currentPlaybackError?.liveParseCurl,
+                        showDismiss: true,
+                        showRetry: true,
+                        showLoginButton: shouldShowPlatformLoginPrompt,
+                        showDetailButton: currentPlaybackError?.liveParseDetail?.isEmpty == false,
+                        onDismiss: {
+                            dismiss()
+                        },
+                        onRetry: {
+                            Task {
+                                await viewModel.loadPlayURL(force: true)
+                            }
+                        },
+                        onLogin: shouldShowPlatformLoginPrompt ? {
+                            authenticationRecoveryRequest = AuthenticationRecoveryRequest(
+                                pluginIDs: SandboxPluginCatalog.platform(for: viewModel.currentRoom.liveType)
+                                    .map { [$0.pluginId] } ?? []
+                            )
+                        } : nil
+                    )
+                    .zIndex(100)
+                } else {
+                    // 播放器 - 始终在同一位置，只改变 frame，不会重建
+                    PlayerContentView(
+                        playerCoordinator: playerCoordinator,
+                        playerModel: playerModel,
+                        isVerticalLiveMode: $isVerticalLiveMode,
+                        videoAspectRatio: $videoAspectRatio
+                    )
+                        .id("stable_player")
+                        .environment(viewModel)
+                        .frame(
+                            width: playerWidth,
+                            height: playerHeight
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        // 新画面手势桥接未启用的系统或内核，保留原有播放器手势处理。
+                        .simultaneousGesture(
+                            DragGesture(minimumDistance: 1).onChanged { _ in },
+                            including: legacyPlayerGestureMask
+                        )
+
+                    // 信息面板 - 根据布局动态显示/隐藏
+                    if showInfoPanel {
+                        if showsSidePanel {
+                            // iPad 横屏：右侧面板
+                            informationArea
+                            .frame(width: 400)
+                            .frame(maxHeight: .infinity, alignment: .topLeading)
+                            .offset(x: geometry.size.width - 400, y: 0)
+                        } else {
+                            // 竖屏：底部面板
+                            informationArea
+                            .frame(maxWidth: .infinity)
+                            .frame(height: max(0, geometry.size.height - playerHeight))
+                            .offset(x: 0, y: playerHeight)
+                        }
+                    }
+
+                    // 用独立的 20pt 左边缘视图提供返回手势，竖屏清屏时让出触摸以恢复控制层。
+                    // 作为 ZStack 兄弟视图，独立于播放器控制层处理左边缘返回手势。
+                    if #available(iOS 18.0, *), !iPhoneLandscapeMode, allowsEdgeDismiss {
+                        EdgeSwipeDismissView(edgeWidth: 20) {
+                            if isFullscreen {
+                                isIPadFullscreen = false
+                                if !usesInPlaceFullscreen {
+                                    requestPhoneOrientation(.portrait)
+                                }
+                            } else {
+                                dismiss()
+                            }
+                        }
+                        .frame(width: 20)
+                        .frame(maxHeight: .infinity, alignment: .leading)
+                    }
+                }
+
+                if isRoomSwitcherPresented {
+                    roomSwitcherOverlay(availableSize: geometry.size)
+                    .zIndex(200)
+                }
+            }
+        }
+        .environment(\.isIPadFullscreen, $isIPadFullscreen)
+        .environment(\.fullUIPlayerIsFullscreen, isFullscreen)
+        .environment(\.fullUIPlayerUsesExpandedLayout, usesExpandedLayout)
+        .environment(\.fullUIPlayerUsesInPlaceFullscreen, usesInPlaceFullscreen)
+        .onChange(of: usesInPlaceFullscreen) { _, usesInPlace in
+            if !usesInPlace { isIPadFullscreen = false }
+        }
+        .onChange(of: usesExpandedLayout) { _, isExpanded in
+            // Entering an expanded phone layout restores details. Fullscreen
+            // choices within that layout and in iPad windows remain in place.
+            if isExpanded, usesPhoneOrientationPolicy {
+                isIPadFullscreen = false
+            }
+        }
+        .onChange(of: verticalSizeClass) { oldValue, newValue in
+            if !usesInPlaceFullscreen, oldValue == .compact, newValue == .regular {
+                isIPadFullscreen = false
+            }
+        }
+        .environment(\.roomSwitcherPresentation, $isRoomSwitcherPresented)
+        .environment(\.verticalLiveControlsVisible, $verticalLiveControlsVisible)
+        .environment(\.verticalLiveControlPopupPresented, $verticalLiveControlPopupPresented)
+        .navigationBarBackButtonHidden(shouldHideSystemBackButton)
+        .interactivePopGestureEnabled(shouldEnableInteractivePopGesture)
+        // 竖屏的左右滑动用于清屏/恢复，避免全屏 zoom 转场先接管右滑。
+        .interactiveDismissDisabled(isFullscreen || isVerticalLiveMode)
+        .onChange(of: viewModel.currentRoom.id) { _, _ in
+            verticalLiveControlsVisible = true
+            verticalLiveControlPopupPresented = false
+        }
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            Logger.debug("[PlayerFlow] Detail scenePhase -> \(newPhase), roomId=\(viewModel.currentRoom.roomId)", category: .player)
+            switch newPhase {
+            case .active:
+                viewModel.resumeDanmuUpdatesIfNeeded()
+                // iPhone：进后台前是横屏全屏（用户主动触发），回前台时保留横屏，
+                // 否则会被设备姿态/系统重新查询 supportedInterfaceOrientations 扳回竖屏。
+                if usesPhoneOrientationPolicy && wasLandscapeBeforeBackground {
+                    wasLandscapeBeforeBackground = false
+                    reassertLandscapeOrientation()
+                }
+            case .background:
+                viewModel.pauseDanmuUpdatesForBackground()
+                // 只在「从活跃态离开」时记录:回前台路径是 background→inactive→active,
+                // 若在 inactive 也记录会被回程的 inactive 用已翻回竖屏的值覆盖,导致保留失效。
+                if oldPhase == .active && usesPhoneOrientationPolicy {
+                    wasLandscapeBeforeBackground = isIPhoneLandscape
+                }
+            case .inactive:
+                // 系统弹窗会短暂进入 inactive；保留横屏记录，但不要取消弹幕翻译。
+                if oldPhase == .active && usesPhoneOrientationPolicy {
+                    wasLandscapeBeforeBackground = isIPhoneLandscape
+                }
+            @unknown default:
+                break
+            }
+        }
+        .onChange(of: windowContext?.window, initial: true) { _, window in
+            guard window?.traitCollection.userInterfaceIdiom == .phone else { return }
+            KSOptions.supportedInterfaceOrientations = isVerticalLiveMode ? .portrait : .allButUpsideDown
+            windowContext?.hostViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        }
+        .onChange(of: isVerticalLiveMode) { _, isVertical in
+            // 竖向直播锁定竖屏，切回普通画幅时恢复自由旋转。
+            if usesPhoneOrientationPolicy {
+                KSOptions.supportedInterfaceOrientations = isVertical ? .portrait : .allButUpsideDown
+                if let rootVC = windowContext?.hostViewController {
+                    rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
+                }
+            }
+        }
+        .onChange(of: viewModel.isPlaying) { _, isPlaying in
+            NowPlayingManager.updatePlaybackState(
+                isPlaying: isPlaying,
+                surfaceID: playbackSession.surfaceID
+            )
+        }
+        .onChange(of: playerCoordinator.state) { _, _ in
+            playbackSession.attach(playerLayer: playerCoordinator.playerLayer)
+        }
+        .onChange(of: categoryRooms) { _, newValue in
+            switcherCategoryRooms = newValue
+        }
+        .task {
+            await viewModel.loadPlayURL()
+        }
+        .onAppear {
+            playbackSession.activate()
+            playbackSession.attach(playerLayer: playerCoordinator.playerLayer)
+            viewModel.playbackSurfaceID = playbackSession.surfaceID
+            // 添加观看历史记录
+            historyModel.addHistory(room: viewModel.currentRoom)
+            // 设置 Now Playing 信息(占位;真正稳定的写入在 RoomInfoViewModel 的 readyToPlay 回调里补写)。
+            // 远程控制命令(播放/暂停等)由 KSPlayer 的 registerRemoteControll 统一注册,此处不再重复注册。
+            NowPlayingManager.update(
+                room: viewModel.currentRoom,
+                isPlaying: false,
+                surfaceID: playbackSession.surfaceID
+            )
+        }
+        .onDisappear {
+            roomSwitchTask?.cancel()
+            viewModel.subtitlePlayback.stop()
+            viewModel.endPlaybackDiagnostics()
+            SupportDiagnosticsService.shared.recordAction(
+                .closedRoom,
+                context: SupportDiagnosticActionContext.room(
+                    viewModel.currentRoom,
+                    additional: ["playerKernel": String(viewModel.selectedPlayerKernel.rawValue)]
+                )
+            )
+            Logger.debug("[PlayerFlow] Detail onDisappear, roomId=\(viewModel.currentRoom.roomId), kernel=\(viewModel.selectedPlayerKernel.rawValue)", category: .player)
+            viewModel.disconnectSocket()
+            // 清除 Now Playing 信息(远程控制命令由 KSPlayer 在 stop() 时自行注销)
+            NowPlayingManager.clear(surfaceID: playbackSession.surfaceID)
+            // 退出时沿用 representable 的拆除路径，立即清空 layer 并避免重复 stop。
+            playerCoordinator.resetPlayer()
+            playbackSession.invalidate()
+            viewModel.playbackSurfaceID = nil
+            // iPhone 返回时强制竖屏
+            if usesPhoneOrientationPolicy {
+                // 设置支持的方向为竖屏
+                KSOptions.supportedInterfaceOrientations = .portrait
+
+                guard let windowScene = windowContext?.windowScene else {
+                    return
+                }
+
+                // 先通知 ViewController 刷新支持的方向
+                if let rootVC = windowContext?.hostViewController {
+                    rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
+                }
+                // 延迟到下一个 run loop，确保 VC 已刷新支持的方向
+                DispatchQueue.main.async {
+                    let geometryPreferences = UIWindowScene.GeometryPreferences.iOS(
+                        interfaceOrientations: .portrait
+                    )
+                    // UIKit 可能在后台调用失败回调；日志闭包不继承 MainActor。
+                    windowScene.requestGeometryUpdate(geometryPreferences) { @Sendable error in
+                        Logger.error("[PlayerFlow] 强制竖屏失败: \(error.localizedDescription)", category: .player)
+                    }
+                }
+            }
+        }
+        .sheet(item: $authenticationRecoveryRequest) { request in
+            NavigationStack {
+                PlatformAccountLoginView(recoveryPluginIDs: request.pluginIDs)
+            }
+        }
+        // 画质面板点击「登录后可用」档位：复用登录恢复 sheet
+        .onChange(of: viewModel.pendingLoginRequest?.id) { _, _ in
+            guard let request = viewModel.pendingLoginRequest else { return }
+            viewModel.pendingLoginRequest = nil
+            authenticationRecoveryRequest = request
+        }
+        .onChange(of: viewModel.lockedQualityNotice) { _, notice in
+            guard let notice else { return }
+            viewModel.lockedQualityNotice = nil
+            presentToast(ToastValue(icon: Image(systemName: "lock.fill"), message: notice))
+        }
+        // 当前平台登录状态变化后重新取流，让被锁定的画质解锁
+        .onReceive(
+            NotificationCenter.default.publisher(for: .platformSessionMetadataDidChange)
+                .compactMap { $0.object as? String }
+                .receive(on: RunLoop.main)
+        ) { pluginId in
+            guard pluginId == currentPluginID else { return }
+            viewModel.refreshPlayback()
+        }
+    }
+
+    // MARK: - Orientation
+
+    /// iPhone 回前台后保留横屏全屏:临时锁定横屏发起几何更新,完成后恢复自由旋转,
+    /// 这样既保留用户主动横屏,又允许之后旋转/双击切回竖屏。
+    private func reassertLandscapeOrientation() {
+        requestPhoneOrientation(.landscape)
+    }
+
+    private func requestPhoneOrientation(_ orientation: UIInterfaceOrientationMask) {
+        guard usesPhoneOrientationPolicy else { return }
+        KSOptions.supportedInterfaceOrientations = orientation
+        guard let windowScene = windowContext?.windowScene else { return }
+        // 先通知 ViewController 刷新支持的方向
+        if let rootVC = windowContext?.hostViewController {
+            rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
+        }
+        // 延迟到下一个 run loop,确保 VC 已刷新支持的方向
+        DispatchQueue.main.async {
+            let geometryPreferences = UIWindowScene.GeometryPreferences.iOS(
+                interfaceOrientations: orientation
+            )
+            windowScene.requestGeometryUpdate(geometryPreferences) { @Sendable error in
+                Logger.warning("[PlayerFlow] 方向更新失败: \(error.localizedDescription)", category: .player)
+            }
+            // 旋转完成后恢复自由旋转,允许用户后续旋转/双击切回竖屏
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                KSOptions.supportedInterfaceOrientations = .allButUpsideDown
+                if let rootVC = windowContext?.hostViewController {
+                    rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
+                }
+            }
+        }
+    }
+
+    // MARK: - Background
+
+    private var backgroundView: some View {
+        BlurredBackgroundView(imageURL: viewModel.currentRoom.userHeadImg)
+            .edgesIgnoringSafeArea(.all)
+    }
+
+    // MARK: - Layouts
+
+    /// 全屏播放器布局（iPhone 横屏 或 iPad 全屏）
+    private var fullscreenPlayerLayout: some View {
+        PlayerContentView(
+            playerCoordinator: playerCoordinator,
+            playerModel: playerModel,
+            isVerticalLiveMode: $isVerticalLiveMode,
+            videoAspectRatio: $videoAspectRatio
+        )
+            .id("stable_player") // 关键：所有布局使用相同的 id
+            .environment(viewModel)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .edgesIgnoringSafeArea(.all)
+    }
+
+    /// iPad 横屏布局（左右分栏）
+    private var iPadLandscapeLayout: some View {
+        HStack(spacing: 0) {
+            // 左侧：播放器
+            PlayerContentView(
+                playerCoordinator: playerCoordinator,
+                playerModel: playerModel,
+                isVerticalLiveMode: $isVerticalLiveMode,
+                videoAspectRatio: $videoAspectRatio
+            )
+                .id("stable_player") // 关键：所有布局使用相同的 id
+                .environment(viewModel)
+                .frame(maxWidth: .infinity)
+
+            informationArea
+                .frame(width: 400)
+        }
+    }
+
+    /// 竖屏布局（上下排列）
+    private var portraitLayout: some View {
+        VStack(spacing: 0) {
+            // 播放器容器
+            PlayerContentView(
+                playerCoordinator: playerCoordinator,
+                playerModel: playerModel,
+                isVerticalLiveMode: $isVerticalLiveMode,
+                videoAspectRatio: $videoAspectRatio
+            )
+                .id("stable_player") // 关键：所有布局使用相同的 id
+                .environment(viewModel)
+                .frame(maxWidth: .infinity)
+
+            informationArea
+        }
+    }
+
+    // MARK: - 播放器下方信息区
+
+    private var informationArea: some View {
+        ZStack(alignment: .bottomTrailing) {
+            VStack(spacing: 0) {
+                StreamerInfoView()
+                    .environment(viewModel)
+                chatListView
+            }
+
+            if showJumpToLatest {
+                jumpToLatestButton
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 72)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            RoomActionDock(
+                isSwitcherPresented: isRoomSwitcherPresented,
+                room: viewModel.currentRoom,
+                onToggleSwitcher: toggleRoomSwitcher,
+                onClearChat: clearChat
+            )
+            .environment(viewModel)
+            .padding(.trailing, 16)
+            .padding(.bottom, 16)
+        }
+    }
+
+    private var chatListView: some View {
+        ChatTableView(
+            messages: viewModel.danmuMessages,
+            showJumpToLatest: $showJumpToLatest,
+            scrollToBottomRequest: $scrollToBottomRequest
+        )
+    }
+
+    private var jumpToLatestButton: some View {
+        Button {
+            scrollToBottomRequest = true
+        } label: {
+            HStack(spacing: 6) {
+                Text("查看最新评论")
+                Image(systemName: "arrow.down")
+            }
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                Capsule()
+                    .fill(Color.black.opacity(AppConstants.PlayerUI.Opacity.overlayMedium))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.25), radius: 4, x: 0, y: 2)
+        }
+    }
+
+    private func roomSwitcherOverlay(availableSize: CGSize) -> some View {
+        ZStack(alignment: .trailing) {
+            Color.black.opacity(0.46)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: dismissRoomSwitcher)
+                .accessibilityHidden(true)
+                .transition(.opacity)
+
+            RoomSwitcherPanel(
+                currentRoom: viewModel.currentRoom,
+                favorites: favoriteModel.roomList,
+                history: historyModel.watchList,
+                category: switcherCategoryRooms,
+                selectedSourceIndex: $selectedRoomSourceIndex,
+                switchingRoomID: switchingRoomID,
+                failedRoomID: failedRoomID,
+                failureMessage: roomSwitchFailureMessage,
+                canLoadMoreCategory: canLoadMoreCategoryRooms,
+                isLoadingMoreCategory: isLoadingMoreCategoryRooms,
+                onLoadMoreCategory: loadMoreSwitcherCategoryRooms,
+                onSelect: switchRoom,
+                onClose: dismissRoomSwitcher
+            )
+            .frame(width: roomSwitcherPanelWidth(for: availableSize))
+            .frame(maxHeight: .infinity)
+            .background {
+                ZStack {
+                    Rectangle().fill(.ultraThinMaterial)
+                    LinearGradient(
+                        colors: [.black.opacity(0.28), .black.opacity(0.52)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                }
+            }
+            .clipShape(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: 26,
+                    bottomLeadingRadius: 26
+                )
+            )
+            .shadow(color: .black.opacity(0.34), radius: 24, x: -10)
+            .environment(\.colorScheme, .dark)
+            .transition(.move(edge: .trailing).combined(with: .opacity))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func roomSwitcherPanelWidth(for size: CGSize) -> CGFloat {
+        if horizontalSizeClass == .regular {
+            return min(480, max(400, size.width * 0.46))
+        }
+        if size.width > size.height {
+            return min(420, max(320, size.width * 0.48))
+        }
+        return max(300, size.width - 16)
+    }
+
+    // MARK: - Helper Methods
+
+    private func clearChat() {
+        withAnimation {
+            viewModel.danmuMessages.removeAll()
+            showJumpToLatest = false
+        }
+    }
+
+    private func toggleRoomSwitcher() {
+        withAnimation(accessibilityReduceMotion ? nil : .snappy(duration: 0.32)) {
+            isRoomSwitcherPresented.toggle()
+        }
+    }
+
+    private func dismissRoomSwitcher() {
+        withAnimation(accessibilityReduceMotion ? nil : .snappy(duration: 0.28)) {
+            isRoomSwitcherPresented = false
+        }
+    }
+
+    private func switchRoom(_ room: LiveModel) {
+        roomSwitchTask?.cancel()
+        switchingRoomID = room.id
+        failedRoomID = nil
+        roomSwitchFailureMessage = nil
+        let requestRoomID = room.id
+
+        roomSwitchTask = Task { @MainActor in
+            do {
+                try await viewModel.switchRoom(to: room)
+                try Task.checkCancellation()
+
+                historyModel.addHistory(room: room)
+                NowPlayingManager.update(
+                    room: room,
+                    isPlaying: false,
+                    surfaceID: playbackSession.surfaceID
+                )
+
+                if switchingRoomID == requestRoomID {
+                    switchingRoomID = nil
+                }
+            } catch is CancellationError {
+                // A newer room selection owns the visible switching state.
+            } catch {
+                guard switchingRoomID == requestRoomID else { return }
+                switchingRoomID = nil
+                failedRoomID = requestRoomID
+                roomSwitchFailureMessage = error.localizedDescription
+            }
+        }
+    }
+
+    @MainActor
+    private func loadMoreSwitcherCategoryRooms() async -> [LiveModel] {
+        guard !isLoadingMoreCategoryRooms,
+              let onLoadMoreCategoryRooms else {
+            return switcherCategoryRooms
+        }
+
+        isLoadingMoreCategoryRooms = true
+        defer { isLoadingMoreCategoryRooms = false }
+
+        let rooms = await onLoadMoreCategoryRooms()
+        switcherCategoryRooms = rooms
+        return rooms
+    }
+}
+
+// MARK: - iPad Fullscreen Support
+
+/// iPad 全屏状态的 Environment Key
+private struct IPadFullscreenEnvironmentKey: EnvironmentKey {
+    static let defaultValue: Binding<Bool> = .constant(false)
+}
+
+extension EnvironmentValues {
+    var isIPadFullscreen: Binding<Bool> {
+        get { self[IPadFullscreenEnvironmentKey.self] }
+        set { self[IPadFullscreenEnvironmentKey.self] = newValue }
+    }
+}
+
+// MARK: - Room Switcher Presentation
+
+private struct RoomSwitcherPresentationEnvironmentKey: EnvironmentKey {
+    static let defaultValue: Binding<Bool> = .constant(false)
+}
+
+extension EnvironmentValues {
+    var roomSwitcherPresentation: Binding<Bool> {
+        get { self[RoomSwitcherPresentationEnvironmentKey.self] }
+        set { self[RoomSwitcherPresentationEnvironmentKey.self] = newValue }
+    }
+}
+
+// MARK: - Vertical Live Mode Environment Key
+
+/// 竖屏直播模式的 Environment Key
+struct VerticalLiveModeEnvironmentKey: EnvironmentKey {
+    static let defaultValue: Bool = false
+}
+
+private struct VerticalLiveControlsVisibleKey: EnvironmentKey {
+    static let defaultValue: Binding<Bool> = .constant(true)
+}
+
+private struct VerticalLiveControlPopupPresentedKey: EnvironmentKey {
+    static let defaultValue: Binding<Bool> = .constant(false)
+}
+
+extension EnvironmentValues {
+    var verticalLiveControlsVisible: Binding<Bool> {
+        get { self[VerticalLiveControlsVisibleKey.self] }
+        set { self[VerticalLiveControlsVisibleKey.self] = newValue }
+    }
+
+    var verticalLiveControlPopupPresented: Binding<Bool> {
+        get { self[VerticalLiveControlPopupPresentedKey.self] }
+        set { self[VerticalLiveControlPopupPresentedKey.self] = newValue }
+    }
+
+    var isVerticalLiveMode: Bool {
+        get { self[VerticalLiveModeEnvironmentKey.self] }
+        set { self[VerticalLiveModeEnvironmentKey.self] = newValue }
+    }
+}
