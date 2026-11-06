@@ -156,8 +156,11 @@ struct FavoritesPageView: View {
                     }
                 }
             } label: {
-                menuLabel(icon: groupMode.icon, title: groupMode.title)
+                Label(groupMode.title, systemImage: groupMode.icon)
+                    .font(.system(size: 20, weight: .semibold))
             }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
 
             Menu {
                 ForEach(FavoriteSortMode.allCases) { mode in
@@ -173,27 +176,16 @@ struct FavoritesPageView: View {
                     }
                 }
             } label: {
-                menuLabel(icon: "arrow.up.arrow.down", title: sortMode.title)
+                Label(sortMode.title, systemImage: "arrow.up.arrow.down")
+                    .font(.system(size: 20, weight: .semibold))
             }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
         }
         .padding(.horizontal, 92)
         .padding(.top, 60)
     }
 
-    /// 两个菜单按钮使用同一种样式，避免一个深底一个浅底。
-    private func menuLabel(icon: String, title: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-            Text(title)
-            Image(systemName: "chevron.down")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-        }
-        .font(.system(size: 20, weight: .semibold))
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
-        .foregroundStyle(.primary)
-    }
 
     // MARK: - 分组与排序
 

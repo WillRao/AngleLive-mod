@@ -9,6 +9,31 @@
 import SwiftUI
 import AngelLiveCore
 
+/// 房间列表排序模式（列表页本地属性，不进入全局设置）。
+private enum RoomSortMode: Int, CaseIterable, Identifiable {
+    case standard = 0
+    case popularity = 1
+    case newestLive = 2
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .standard: return "默认"
+        case .popularity: return "人气"
+        case .newestLive: return "最新开播"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .standard: return "list.bullet"
+        case .popularity: return "flame.fill"
+        case .newestLive: return "sparkles"
+        }
+    }
+}
+
 struct RoomListPageView: View {
     let liveType: LiveType
 
@@ -18,26 +43,67 @@ struct RoomListPageView: View {
     @State private var store: RoomListStore
     @State private var isSidebarOpen = false
     @State private var expandedMainIds: Set<String> = []
+    @State private var sortMode: RoomSortMode
     @State private var player: PlayerPresentation?
     @FocusState private var focus: FocusField?
 
     private enum FocusField: Hashable {
         case room(Int)
-        case categoryButton
+        case sortButton
         case sidebarMain(Int)
         case sidebarSub(Int, Int)
     }
 
     private let columns = Array(repeating: GridItem(.fixed(380), spacing: 50), count: 4)
 
+    private static let sortKey = "AngelLiveTVOS2.RoomSortMode"
+
     init(liveType: LiveType) {
         self.liveType = liveType
         _store = State(initialValue: RoomListStore(liveType: liveType))
+        let stored = UserDefaults.standard.integer(forKey: Self.sortKey)
+        _sortMode = State(initialValue: RoomSortMode(rawValue: stored) ?? .standard)
+    }
+
+    /// 按当前排序模式展示的房间列表（分页触发仍按显示位置判断）。
+    private var displayRooms: [LiveModel] {
+        let rooms = store.rooms
+        switch sortMode {
+        case .standard:
+            return rooms
+        case .popularity:
+            return rooms.sorted { popularity($0) > popularity($1) }
+        case .newestLive:
+            return rooms.sorted { lhs, rhs in
+                let lhsRank = liveRank(lhs), rhsRank = liveRank(rhs)
+                if lhsRank != rhsRank { return lhsRank < rhsRank }
+                return popularity(lhs) > popularity(rhs)
+            }
+        }
+    }
+
+    private func liveRank(_ room: LiveModel) -> Int {
+        switch LiveState(rawValue: room.liveState ?? "3") {
+        case .live: return 0
+        case .video: return 1
+        case .unknow, .none: return 2
+        case .close: return 3
+        }
+    }
+
+    private func popularity(_ room: LiveModel) -> Double {
+        guard let raw = room.liveWatchedCount else { return -1 }
+        let text = raw.replacingOccurrences(of: ",", with: "")
+        if text.hasSuffix("万") || text.hasSuffix("w") || text.hasSuffix("W") {
+            return (Double(text.dropLast()) ?? 0) * 10000
+        }
+        return Double(text) ?? -1
     }
 
     var body: some View {
         ZStack(alignment: .leading) {
-            Color.black.ignoresSafeArea()
+            Color.primary.colorInvert()
+                .ignoresSafeArea()
             content
 
             if isSidebarOpen {
@@ -59,7 +125,7 @@ struct RoomListPageView: View {
                 Task { await store.loadMoreIfNeeded(focusedIndex: index) }
             case .sidebarMain, .sidebarSub:
                 break
-            case .categoryButton:
+            case .sortButton:
                 break
             }
         }
@@ -129,22 +195,33 @@ struct RoomListPageView: View {
 
             Spacer()
 
-            Button {
-                isSidebarOpen = true
+            Menu {
+                ForEach(RoomSortMode.allCases) { mode in
+                    Button {
+                        sortMode = mode
+                        UserDefaults.standard.set(mode.rawValue, forKey: Self.sortKey)
+                    } label: {
+                        if sortMode == mode {
+                            Label(mode.title, systemImage: "checkmark")
+                        } else {
+                            Text(mode.title)
+                        }
+                    }
+                }
             } label: {
-                Label("分类", systemImage: "line.3.horizontal")
+                Label(sortMode.title, systemImage: sortMode.icon)
                     .font(.system(size: 20, weight: .semibold))
             }
             .buttonStyle(.bordered)
             .buttonBorderShape(.capsule)
-            .focused($focus, equals: .categoryButton)
+            .focused($focus, equals: .sortButton)
         }
         .padding(.horizontal, 92)
     }
 
     private var grid: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: 50) {
-            ForEach(Array(store.rooms.enumerated()), id: \.element.id) { index, room in
+            ForEach(Array(displayRooms.enumerated()), id: \.element.id) { index, room in
                 Button {
                     openRoom(room)
                 } label: {
@@ -219,7 +296,7 @@ struct RoomListPageView: View {
             }
             .padding(28)
         }
-        .frame(width: 420)
+        .frame(width: 210)
         .frame(maxHeight: .infinity)
         .background(.ultraThinMaterial)
         .focusSection()
@@ -266,7 +343,7 @@ struct RoomListPageView: View {
             enterFromLive: true,
             roomType: .live
         )
-        viewModel.roomList = store.rooms
+        viewModel.roomList = displayRooms
         isSidebarOpen = false
         player = PlayerPresentation(viewModel: viewModel)
     }
